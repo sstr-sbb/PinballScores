@@ -100,7 +100,7 @@ class ColorTable:
 
             # --- Column treeview ---
             t = ttk.Treeview(body, columns=("v",), show="", selectmode="none",
-                             padding=0)
+                             padding=0, style="Borderless.Treeview")
             t.column("#0", width=0, stretch=False)
             t.column("v", width=width, anchor=anchor, stretch=stretch)
 
@@ -253,6 +253,11 @@ def _apply_theme(root: tk.Tk):
                      font=(FONT_FAMILY, 10),
                      borderwidth=0,
                      relief="flat")
+
+    # Borderless variant for ColorTable sub-treeviews (no surrounding frame)
+    style.layout("Borderless.Treeview", [
+        ("Treeview.treearea", {"sticky": "nswe"}),
+    ])
 
     style.configure("Treeview.Heading",
                      background=BG_HEADER,
