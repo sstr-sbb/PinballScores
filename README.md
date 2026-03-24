@@ -22,6 +22,8 @@ A desktop app for tracking your standings on [ATGames ArcadeNet](https://www.atg
 
 Pre-built standalone executables for Windows, Linux, and macOS are available on the [Releases](https://github.com/sstr-sbb/PinballScores/releases/latest) page. No Python installation required.
 
+**Note:** The macOS build is untested. If you run into issues, please try the source installation below.
+
 ## Installation (from source)
 
 Requires Python 3.10+ and a working tkinter installation (included with most Python distributions).
