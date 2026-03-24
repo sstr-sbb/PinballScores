@@ -690,9 +690,12 @@ class PinballScoresApp:
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _set_boxart(self, url: str, pil_img: Image.Image):
-        tk_img = ImageTk.PhotoImage(pil_img)
-        self._image_cache[url] = tk_img
-        self.boxart_label.config(image=tk_img, width=tk_img.width())
+        try:
+            tk_img = ImageTk.PhotoImage(pil_img)
+            self._image_cache[url] = tk_img
+            self.boxart_label.config(image=tk_img, width=tk_img.width())
+        except Exception:
+            self.boxart_label.config(image="", width=0)
 
     def _show_detail(self, game: dict):
         self.detail_label.config(text=game["name"].upper())
