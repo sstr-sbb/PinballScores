@@ -33,9 +33,6 @@ TOP10_BG = "#1a2e1a"
 TOP50_BG = "#141e30"
 
 FONT_FAMILY = "Ubuntu Sans Mono"
-LCD_FONT_FAMILY = "DSEG7 Classic"
-
-
 def _format_score(score_str: str) -> str:
     try:
         return f"{int(score_str):,}".replace(",", ".")
@@ -66,6 +63,7 @@ class ColorTable:
         """Create a color table.
 
         col_defs: list of (col_id, header_text, width, anchor, stretch, fg_color)
+                  or (col_id, header_text, width, anchor, stretch, fg_color, font)
         """
         self._trees: list[ttk.Treeview] = []
         self._row_count = 0
@@ -85,7 +83,10 @@ class ColorTable:
         body = tk.Frame(parent, bg=BG_PANEL)
         body.pack(fill=tk.BOTH, expand=True)
 
-        for _, text, width, anchor, stretch, fg in col_defs:
+        for col_def in col_defs:
+            _, text, width, anchor, stretch, fg = col_def[:6]
+            font = col_def[6] if len(col_def) > 6 else None
+
             # --- Header cell ---
             if stretch:
                 hc = tk.Frame(header, bg=BG_HEADER)
@@ -103,10 +104,13 @@ class ColorTable:
             t.column("#0", width=0, stretch=False)
             t.column("v", width=width, anchor=anchor, stretch=stretch)
 
-            t.tag_configure("even", foreground=fg, background=ROW_EVEN)
-            t.tag_configure("odd", foreground=fg, background=ROW_ODD)
-            t.tag_configure("even_sel", foreground=fg, background=SEL_BG)
-            t.tag_configure("odd_sel", foreground=fg, background=SEL_BG)
+            tag_kw = {"foreground": fg}
+            if font:
+                tag_kw["font"] = font
+            t.tag_configure("even", background=ROW_EVEN, **tag_kw)
+            t.tag_configure("odd", background=ROW_ODD, **tag_kw)
+            t.tag_configure("even_sel", background=SEL_BG, **tag_kw)
+            t.tag_configure("odd_sel", background=SEL_BG, **tag_kw)
 
             if stretch:
                 t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -348,7 +352,7 @@ class PinballScoresApp:
         self.notebook = ttk.Notebook(left)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Score column color definitions
+        # Score column color definitions (with LCD font)
         score_col_defs = [
             ("high",  "HIGHSCORE", 110, GOLD),
             ("top10", "TOP 10",    110, NEON_GREEN),

@@ -36,14 +36,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The app bundles the [DSEG7 Classic](https://github.com/keshikan/DSEG) LCD font. To use it, install it on your system:
-
-```bash
-mkdir -p ~/.local/share/fonts
-cp fonts/DSEG7Classic-Bold.ttf ~/.local/share/fonts/
-fc-cache -f
-```
-
 ## Usage
 
 ```bash
