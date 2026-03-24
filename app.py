@@ -738,10 +738,17 @@ class PinballScoresApp:
             ), tags=tags)
 
         if search:
-            for item in self.detail_tree.get_children():
+            children = self.detail_tree.get_children()
+            total = len(children)
+            for item in children:
                 if "highlight" in self.detail_tree.item(item, "tags"):
-                    self.detail_tree.see(item)
                     self.detail_tree.selection_set(item)
+                    # Scroll so the user's row appears in the center
+                    idx = self.detail_tree.index(item)
+                    if total > 0:
+                        # Position the row at ~center of visible area
+                        fraction = max(0.0, (idx - 5) / total)
+                        self.detail_tree.yview_moveto(fraction)
                     break
 
     def _show_progress(self):
