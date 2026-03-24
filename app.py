@@ -74,12 +74,7 @@ class ColorTable:
         scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Colored header row
-        header = tk.Frame(parent, bg=BG_HEADER, height=26)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-
-        # Body frame for synced treeviews
+        # Body frame — each column is a vertical frame with header + treeview
         body = tk.Frame(parent, bg=BG_PANEL)
         body.pack(fill=tk.BOTH, expand=True)
 
@@ -87,19 +82,21 @@ class ColorTable:
             _, text, width, anchor, stretch, fg = col_def[:6]
             font = col_def[6] if len(col_def) > 6 else None
 
-            # --- Header cell ---
+            # --- Column container (header + tree stacked vertically) ---
             if stretch:
-                hc = tk.Frame(header, bg=BG_HEADER)
-                hc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                col_frame = tk.Frame(body, bg=BG_PANEL)
+                col_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             else:
-                hc = tk.Frame(header, width=width, bg=BG_HEADER)
-                hc.pack(side=tk.LEFT, fill=tk.Y)
-                hc.pack_propagate(False)
-            tk.Label(hc, text=text, fg=fg, bg=BG_HEADER,
-                     font=(FONT_FAMILY, 9, "bold")).pack(expand=True, fill=tk.BOTH)
+                col_frame = tk.Frame(body, width=width, bg=BG_PANEL)
+                col_frame.pack(side=tk.LEFT, fill=tk.Y)
+                col_frame.pack_propagate(False)
 
-            # --- Column treeview ---
-            t = ttk.Treeview(body, columns=("v",), show="", selectmode="none",
+            # Header label at top of column
+            tk.Label(col_frame, text=text, fg=fg, bg=BG_HEADER, height=1,
+                     font=(FONT_FAMILY, 9, "bold")).pack(fill=tk.X)
+
+            # Treeview below header
+            t = ttk.Treeview(col_frame, columns=("v",), show="", selectmode="none",
                              padding=0, style="Borderless.Treeview")
             t.column("#0", width=0, stretch=False)
             t.column("v", width=width, anchor=anchor, stretch=stretch)
@@ -112,14 +109,12 @@ class ColorTable:
             t.tag_configure("even_sel", background=SEL_BG, **tag_kw)
             t.tag_configure("odd_sel", background=SEL_BG, **tag_kw)
 
-            if stretch:
-                t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            else:
-                t.pack(side=tk.LEFT, fill=tk.Y)
+            t.pack(fill=tk.BOTH, expand=True)
 
             t.bind("<Button-1>", self._on_click)
-            t.bind("<Button-4>", lambda e: self._scroll_all("scroll", -3, "units"))
-            t.bind("<Button-5>", lambda e: self._scroll_all("scroll", 3, "units"))
+            t.bind("<Button-4>", self._on_scroll_up)
+            t.bind("<Button-5>", self._on_scroll_down)
+            t.bind("<MouseWheel>", self._on_mousewheel)
             self._trees.append(t)
 
         # Connect scrollbar to first tree, sync rest
@@ -130,6 +125,18 @@ class ColorTable:
     def _scroll_all(self, *args):
         for t in self._trees:
             t.yview(*args)
+
+    def _on_scroll_up(self, _event):
+        self._scroll_all("scroll", -3, "units")
+        return "break"
+
+    def _on_scroll_down(self, _event):
+        self._scroll_all("scroll", 3, "units")
+        return "break"
+
+    def _on_mousewheel(self, event):
+        self._scroll_all("scroll", -1 * (event.delta // 120), "units")
+        return "break"
 
     def _on_yscroll(self, first, last):
         self._scroll.set(first, last)
