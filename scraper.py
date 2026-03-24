@@ -1,0 +1,244 @@
+"""Scraper for ATGames ArcadeNet leaderboards."""
+
+import json
+import string
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+BASE_URL = "https://www.atgames.net/leaderboards"
+TITLES_AFTER_URL = f"{BASE_URL}/titles/after"
+SCORES_JSON_URL = f"{BASE_URL}/scores-json"
+DATA_DIR = Path(__file__).parent / "data"
+SCORES_FILE = DATA_DIR / "scores.json"
+
+MAX_WORKERS_GAMES = 5
+MAX_WORKERS_SCORES = 10
+
+_thread_local = threading.local()
+
+
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "PinballScores/1.0",
+        "Accept": "application/json",
+    })
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    return s
+
+
+SESSION = _new_session()
+
+
+def _fetch_games_for_prefix(prefix: str, session: requests.Session) -> list[dict]:
+    """Fetch all games for a single prefix letter, handling pagination."""
+    games = []
+    after = ""
+
+    while True:
+        params = {
+            "after": after,
+            "rule": "AND",
+            "prefix": prefix,
+            "order": "",
+            "friends": "",
+            "table": "",
+            "table_rule": "",
+            "keyword": "",
+        }
+
+        resp = session.get(TITLES_AFTER_URL, params=params)
+        resp.raise_for_status()
+        batch = resp.json()
+
+        if not batch:
+            break
+
+        for game in batch:
+            games.append({
+                "game_id": game["game_id"],
+                "name": game["name"],
+                "internal_number": game["internal_number"],
+                "boxart": game.get("boxart_480w") or game.get("boxart", ""),
+            })
+
+        if len(batch) < 8:
+            break
+
+        after = str(batch[-1]["game_id"])
+        time.sleep(0.1)
+
+    return games
+
+
+def fetch_all_games(progress_callback=None) -> list[dict]:
+    """Fetch all game titles in parallel by prefix letter.
+
+    Args:
+        progress_callback: Optional callable(completed_prefixes, total_prefixes, total_games_so_far)
+    """
+    prefixes = list(string.ascii_lowercase)
+    all_games: list[dict] = []
+    seen_ids: set[int] = set()
+    lock = threading.Lock()
+    completed = 0
+
+    def _do_prefix(prefix: str) -> list[dict]:
+        session = _new_session()
+        return _fetch_games_for_prefix(prefix, session)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_GAMES) as pool:
+        futures = {pool.submit(_do_prefix, p): p for p in prefixes}
+
+        for future in as_completed(futures):
+            games = future.result()
+            with lock:
+                for g in games:
+                    if g["game_id"] not in seen_ids:
+                        seen_ids.add(g["game_id"])
+                        all_games.append(g)
+                completed += 1
+
+                if progress_callback:
+                    progress_callback(completed, len(prefixes), len(all_games))
+
+    all_games.sort(key=lambda g: g["name"].lower())
+    return all_games
+
+
+def fetch_scores(internal_number: int, session: requests.Session | None = None) -> list[dict]:
+    """Fetch top 100 scores for a game."""
+    s = session or SESSION
+    url = f"{SCORES_JSON_URL}/{internal_number}"
+    resp = s.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+
+    return [
+        {
+            "rank": entry.get("rank"),
+            "userName": entry.get("userName", ""),
+            "signature": entry.get("signature", ""),
+            "score": entry.get("score", "0"),
+            "hardware": entry.get("hardware", ""),
+            "createdAt": entry.get("createdAt", ""),
+        }
+        for entry in data
+    ]
+
+
+def scrape_all(progress_callback=None) -> dict:
+    """Scrape all games and their top 100 scores using a pipeline.
+
+    Games and scores are fetched concurrently: as soon as a prefix batch of
+    games is discovered, their scores are submitted for fetching immediately.
+
+    Args:
+        progress_callback: Optional callable(scores_done, games_discovered,
+            games_done, game_name) — called on every score completion.
+            `games_done` is True once all prefixes have been fetched.
+    """
+    prefixes = list(string.ascii_lowercase)
+    all_data: dict[str, dict] = {}
+    seen_ids: set[int] = set()
+    lock = threading.Lock()
+    scores_completed = 0
+    games_discovered = 0
+    prefixes_done = 0
+
+    score_futures: dict = {}
+
+    def _get_thread_session() -> requests.Session:
+        if not hasattr(_thread_local, "session"):
+            _thread_local.session = _new_session()
+        return _thread_local.session
+
+    def _fetch_scores_task(game: dict) -> tuple[dict, list[dict] | None, str | None]:
+        try:
+            scores = fetch_scores(game["internal_number"], session=_get_thread_session())
+            return game, scores, None
+        except Exception as e:
+            return game, None, str(e)
+
+    def _collect_score(future):
+        nonlocal scores_completed
+        game, scores, error = future.result()
+        with lock:
+            scores_completed += 1
+            if progress_callback:
+                progress_callback(
+                    scores_completed, games_discovered,
+                    prefixes_done == len(prefixes), game["name"],
+                )
+            if error:
+                return
+            all_data[str(game["game_id"])] = {
+                "name": game["name"],
+                "game_id": game["game_id"],
+                "internal_number": game["internal_number"],
+                "boxart": game.get("boxart", ""),
+                "scores": scores,
+            }
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_GAMES) as games_pool, \
+         ThreadPoolExecutor(max_workers=MAX_WORKERS_SCORES) as scores_pool:
+
+        prefix_futures = {games_pool.submit(
+            _fetch_games_for_prefix, p, _new_session()
+        ): p for p in prefixes}
+
+        for pf in as_completed(prefix_futures):
+            games = pf.result()
+            with lock:
+                prefixes_done += 1
+                new_games = []
+                for g in games:
+                    if g["game_id"] not in seen_ids:
+                        seen_ids.add(g["game_id"])
+                        new_games.append(g)
+                games_discovered += len(new_games)
+
+            for g in new_games:
+                fut = scores_pool.submit(_fetch_scores_task, g)
+                fut.add_done_callback(_collect_score)
+                score_futures[fut] = g
+
+        # Wait for remaining score fetches
+        for sf in as_completed(score_futures):
+            pass  # results already collected via callback
+
+    return all_data
+
+
+def save_data(data: dict) -> None:
+    """Save scraped data to disk."""
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(SCORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_data() -> dict | None:
+    """Load previously scraped data from disk."""
+    if not SCORES_FILE.exists():
+        return None
+    with open(SCORES_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+if __name__ == "__main__":
+    def _progress(scores_done, games_found, games_done, name):
+        total_str = str(games_found) if games_done else f"~{games_found}"
+        if scores_done % 25 == 0 or scores_done == games_found:
+            print(f"[{scores_done}/{total_str}] {name}")
+
+    data = scrape_all(progress_callback=_progress)
+    save_data(data)
+    print(f"Fertig! {len(data)} Spiele gespeichert.")
