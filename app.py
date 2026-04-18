@@ -102,9 +102,20 @@ def _format_score(score_str: str) -> str:
         return score_str
 
 
-def _get_thresholds(scores: list[dict]) -> dict:
-    """Extract score thresholds from a scores list."""
-    by_rank = {s["rank"]: s["score"] for s in scores if s.get("rank")}
+def _get_thresholds(scores: list[dict], hw_filter: set[str] | None = None) -> dict:
+    """Extract score thresholds from a scores list.
+    If hw_filter is set, only consider scores from those hardware codes."""
+    if hw_filter:
+        scores = [s for s in scores if s.get("hardware", "") in hw_filter]
+        # Re-rank after filtering
+        for i, s in enumerate(scores):
+            s = dict(s)  # don't mutate originals
+            scores[i] = s
+        by_rank = {}
+        for i, s in enumerate(scores):
+            by_rank[i + 1] = s["score"]
+    else:
+        by_rank = {s["rank"]: s["score"] for s in scores if s.get("rank")}
     return {
         "top100": by_rank.get(100, ""),
         "top50": by_rank.get(50, ""),
@@ -416,6 +427,19 @@ def _hw_name(code: str) -> str:
     return HARDWARE_NAMES.get(code, code)
 
 
+# Reverse map: product name -> set of hardware codes
+_HW_GROUPS: dict[str, set[str]] = {}
+for _code, _name in HARDWARE_NAMES.items():
+    _HW_GROUPS.setdefault(_name, set()).add(_code)
+
+
+def _hw_codes_for_filter(filter_name: str) -> set[str] | None:
+    """Return set of hardware codes for a filter name, or None for 'All Devices'."""
+    if filter_name == "All Devices":
+        return None
+    return _HW_GROUPS.get(filter_name, set())
+
+
 def _apply_theme(root: tk.Tk):
     """Apply dark pinball arcade theme to ttk widgets."""
     style = ttk.Style(root)
@@ -546,6 +570,18 @@ class PinballScoresApp:
         tk.Label(top, text="SCORE CHASER", fg=AMBER, bg=BG_DARK,
                  font=(_TITLE_FONT_FAMILY, 16)).pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
+
+        # Hardware filter dropdown
+        tk.Label(top, text="DEVICE", fg=FG_DIM, bg=BG_DARK,
+                 font=(FONT_FAMILY, 9)).pack(side=tk.LEFT, padx=(24, 4))
+        self._hw_filter_var = tk.StringVar(value="All Devices")
+        self._hw_filter = ttk.Combobox(
+            top, textvariable=self._hw_filter_var, state="readonly",
+            width=16, font=(FONT_FAMILY, 10),
+        )
+        self._hw_filter["values"] = ["All Devices"]
+        self._hw_filter.pack(side=tk.LEFT)
+        self._hw_filter.bind("<<ComboboxSelected>>", lambda _: self._on_hw_filter())
 
         # ArcadeNet login button (right side of top bar)
         self.login_btn = ttk.Button(top, text="LOGIN", command=self._start_login)
@@ -927,6 +963,7 @@ class PinballScoresApp:
             self.login_btn.config(text="LOGOUT")
             self.login_status.config(text=f"✓ {username}", fg=NEON_GREEN)
             self._fetch_personal_scores()
+            self._start_scrape()  # Refresh leaderboard data after login
         elif error:
             self.login_status.config(text="Login failed", fg=NEON_PINK)
             messagebox.showerror("Login Error", error)
@@ -950,7 +987,62 @@ class PinballScoresApp:
     def _on_personal_scores(self, scores: list[dict]):
         """Called when personal scores are fetched."""
         self._personal_scores = scores
-        self._on_search()  # Refresh tabs to show personal data
+        self._backfill_missing_games()
+        self._on_search()
+
+    def _backfill_missing_games(self):
+        """Fetch top-100 scores for games in personal data but not in scraped data."""
+        if not self._personal_scores:
+            return
+        missing = [s for s in self._personal_scores
+                   if str(s.get("game_id", "")) not in self.data
+                   and s.get("internal_number")]
+        if not missing:
+            return
+
+        def do_fetch():
+            from scraper import fetch_scores
+            added = 0
+            for ps in missing:
+                gid = str(ps["game_id"])
+                if gid in self.data:
+                    continue
+                try:
+                    top_scores = fetch_scores(ps["internal_number"])
+                    self.data[gid] = {
+                        "name": ps.get("name", "Unknown"),
+                        "game_id": ps["game_id"],
+                        "internal_number": ps["internal_number"],
+                        "boxart": ps.get("boxart_480w") or ps.get("boxart", ""),
+                        "scores": top_scores,
+                    }
+                    added += 1
+                except Exception:
+                    pass
+            if added:
+                self.root.after(0, self._on_search)
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _on_hw_filter(self):
+        """Hardware filter changed — refresh all views."""
+        self._on_search()
+
+    def _update_hw_filter_options(self):
+        """Update the hardware filter dropdown with devices found in the data."""
+        hw_names = set()
+        for game in self.data.values():
+            for s in game.get("scores", []):
+                hw = s.get("hardware", "")
+                name = _hw_name(hw)
+                if name:
+                    hw_names.add(name)
+        options = ["All Devices"] + sorted(hw_names)
+        self._hw_filter["values"] = options
+
+    def _get_hw_filter(self) -> set[str] | None:
+        """Return current hardware filter codes, or None for all."""
+        return _hw_codes_for_filter(self._hw_filter_var.get())
 
     def _on_close(self):
         self.root.destroy()
@@ -1037,6 +1129,7 @@ class PinballScoresApp:
 
     def _populate_tabs(self, search: str = ""):
         has_search = bool(search and self.data)
+        hw_filter = self._get_hw_filter()
 
         # Rebuild All Games table if user-column state changed
         self._rebuild_allgames_table(with_user=has_search)
@@ -1052,23 +1145,35 @@ class PinballScoresApp:
             for game_id, game in self.data.items():
                 # First check leaderboard data (top 100)
                 entry = None
+                in_top100 = False
                 for s in game["scores"]:
                     if search == s.get("userName", "").lower():
                         entry = s
+                        in_top100 = True
                         break
                 # If not in top 100, check personal API data
                 if entry is None and game_id in personal_map:
                     entry = personal_map[game_id]
+                if entry is not None:
+                    entry = dict(entry)
+                    entry["_in_top100"] = in_top100
                 user_map[game_id] = entry
 
         sorted_games = sorted(self.data.items(), key=lambda x: x[1]["name"].lower())
         sorted_games = [(gid, g) for gid, g in sorted_games if gid not in self._hidden_games]
         for game_id, game in sorted_games:
-            th = _get_thresholds(game["scores"])
+            th = _get_thresholds(game["scores"], hw_filter)
             if has_search:
                 entry = user_map.get(game_id)
-                rank_str = str(entry["rank"]) if entry else "unranked"
-                score_str = _format_score(entry["score"]) if entry else ""
+                if entry:
+                    if not hw_filter and not entry.get("_in_top100"):
+                        rank_str = "> 100"
+                    else:
+                        rank_str = str(entry["rank"])
+                    score_str = _format_score(entry["score"])
+                else:
+                    rank_str = "unranked"
+                    score_str = ""
                 self.allgames_table.insert((
                     game["name"], rank_str, score_str,
                     _format_score(th["high"]),
@@ -1100,7 +1205,7 @@ class PinballScoresApp:
         for game_id, game in self.data.items():
             if game_id in self._hidden_games:
                 continue
-            th = _get_thresholds(game["scores"])
+            th = _get_thresholds(game["scores"], hw_filter)
             entry = user_map.get(game_id)
             if entry:
                 ranked.append((game_id, game, entry, th))
@@ -1132,9 +1237,13 @@ class PinballScoresApp:
 
         ranked.sort(key=lambda x: (x[2].get("rank", 999)))
         for game_id, game, entry, th in ranked:
+            if not hw_filter and not entry.get("_in_top100"):
+                rank_str = "> 100"
+            else:
+                rank_str = entry.get("rank", "")
             self.ranked_table.insert((
                 game["name"],
-                entry.get("rank", ""),
+                rank_str,
                 entry.get("createdAt", "")[:10],
                 _format_score(entry.get("score", "0")),
                 _format_score(th["high"]),
@@ -1205,21 +1314,29 @@ class PinballScoresApp:
         self.detail_tree.delete(*self.detail_tree.get_children())
 
         search = self.search_var.get().strip().lower()
+        hw_filter = self._get_hw_filter()
+        user_found_in_list = False
 
-        for s in game["scores"]:
-            rank = s.get("rank", 999)
+        # Filter and re-rank scores by hardware if filter is active
+        scores = game["scores"]
+        if hw_filter:
+            scores = [s for s in scores if s.get("hardware", "") in hw_filter]
+
+        for i, s in enumerate(scores):
+            display_rank = i + 1 if hw_filter else s.get("rank", 999)
             tags: tuple = ()
             if search and search == s.get("userName", "").lower():
                 tags = ("highlight",)
-            elif rank == 1:
+                user_found_in_list = True
+            elif display_rank == 1:
                 tags = ("rank1",)
-            elif rank <= 10:
+            elif display_rank <= 10:
                 tags = ("top10",)
-            elif rank <= 50:
+            elif display_rank <= 50:
                 tags = ("top50",)
 
             self.detail_tree.insert("", tk.END, values=(
-                rank,
+                display_rank,
                 s.get("userName", ""),
                 s.get("signature", ""),
                 _format_score(s.get("score", "0")),
@@ -1227,16 +1344,32 @@ class PinballScoresApp:
                 s.get("createdAt", "")[:10],
             ), tags=tags)
 
-        if search:
+        # If user not in top 100, append from personal scores
+        if search and not user_found_in_list:
+            game_id = str(game.get("game_id", ""))
+            personal_map = self._get_personal_map(search)
+            ps = personal_map.get(game_id)
+            if ps:
+                self.detail_tree.insert("", tk.END, values="", tags=("game_sep",))
+                detail_rank = "> 100" if not hw_filter else ps.get("rank", "")
+                self.detail_tree.insert("", tk.END, values=(
+                    detail_rank,
+                    ps.get("userName", ""),
+                    ps.get("signature", ""),
+                    _format_score(ps.get("score", "0")),
+                    _hw_name(ps.get("hardware", "")),
+                    ps.get("createdAt", "")[:10],
+                ), tags=("highlight",))
+                user_found_in_list = True
+
+        if search and user_found_in_list:
             children = self.detail_tree.get_children()
             total = len(children)
             for item in children:
                 if "highlight" in self.detail_tree.item(item, "tags"):
                     self.detail_tree.selection_set(item)
-                    # Scroll so the user's row appears in the center
                     idx = self.detail_tree.index(item)
                     if total > 0:
-                        # Position the row at ~center of visible area
                         fraction = max(0.0, (idx - 5) / total)
                         self.detail_tree.yview_moveto(fraction)
                     break
@@ -1635,6 +1768,8 @@ class PinballScoresApp:
         self.status_var.set(f"{len(data)} games loaded.")
         self._hide_progress()
         self.scrape_btn.config(state=tk.NORMAL)
+        self._update_hw_filter_options()
+        self._backfill_missing_games()
         self._on_search()
 
     def _on_scrape_error(self, error: str):

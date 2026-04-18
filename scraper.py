@@ -458,10 +458,11 @@ def is_token_valid(token: str | None) -> bool:
     return time.time() < exp
 
 
-def fetch_personal_scores(token: str, model: str = "RK9920") -> list[dict]:
+def fetch_personal_scores(token: str) -> list[dict]:
     """Fetch all personal high scores using an authenticated token.
 
     Paginates through all results (API limit is 5 per page).
+    Fetches across all hardware models for overall rankings.
     Returns a list of dicts with keys: game_id, internal_number, name, boxart,
     rank, score, signature, hardware, created_at, etc.
     """
@@ -470,7 +471,7 @@ def fetch_personal_scores(token: str, model: str = "RK9920") -> list[dict]:
     after = None
 
     while True:
-        params: dict = {"limit": 5, "model": model}
+        params: dict = {"limit": 5}
         if after:
             params["after"] = after
 
