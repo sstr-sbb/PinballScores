@@ -1,9 +1,11 @@
 """ScoreChaser - ATGames Leaderboard Viewer."""
 
 import io
+import random
 import sys
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import customtkinter as ctk
@@ -16,6 +18,9 @@ from scraper import (
     load_settings, save_settings, login_via_browser,
     is_token_valid, get_token_username,
     fetch_personal_scores, fetch_scores,
+    load_snapshot, save_snapshot,
+    load_personal_scores, save_personal_scores,
+    load_tournaments_cache, save_tournaments_cache,
 )
 
 # -- Asset paths (PyInstaller extracts data to sys._MEIPASS) --
@@ -46,8 +51,41 @@ GOLD = "#ffd000"
 HIGHLIGHT_BG = "#2a1800"
 
 # -- Fonts --
-FONT_FAMILY = "Ubuntu Sans Mono"
-TITLE_FONT_FAMILY = FONT_FAMILY  # fallback
+# Platform-appropriate monospace fallbacks in case the bundled TTFs
+# can't be loaded (Tk falls back silently otherwise, giving odd defaults).
+if sys.platform == "win32":
+    FONT_FAMILY = "Consolas"
+    TITLE_FONT_FAMILY = "Consolas"
+elif sys.platform == "darwin":
+    FONT_FAMILY = "Menlo"
+    TITLE_FONT_FAMILY = "Menlo"
+else:
+    FONT_FAMILY = "Ubuntu Sans Mono"
+    TITLE_FONT_FAMILY = "Ubuntu Sans Mono"
+
+# -- Motivational quotes shown after refresh popup --
+MOTIVATING_QUOTES = [
+    "Every flip brings you closer to glory.",
+    "One more ball, one more chance!",
+    "The leaderboard waits for no one.",
+    "Nudge harder. Play smarter.",
+    "Greatness is just one multiball away.",
+    "Don't tilt — triumph!",
+    "Legends are forged at the flippers.",
+    "Progress is the highest score.",
+    "The silver ball favors the bold.",
+    "Your name belongs at the top.",
+    "Every game is a chance to rise.",
+    "Skill pays the bills — on the leaderboard.",
+    "Ramps were made to be combo'd.",
+    "Keep your eye on the ball.",
+    "Champions chase — and conquer.",
+    "Drain today, dominate tomorrow.",
+    "The next jackpot has your name on it.",
+    "Play like the ball is on fire.",
+    "A true player never stops chasing.",
+    "There's always one more point to earn.",
+]
 
 # -- Hardware mapping --
 HARDWARE_NAMES = {
@@ -102,6 +140,20 @@ def _compact_score(score_str: str) -> str:
     return f"{val:,}".replace(",", ".")
 
 
+def _format_rank_display(overall: int | None, device: int | None,
+                          device_name: str) -> str:
+    """Format rank: '#97 (#23 on Pinball 4K)', '#54' if equal, or '> 100 (...)'."""
+    if overall is not None and device is not None:
+        if overall == device or not device_name:
+            return f"#{overall}"
+        return f"#{overall} (#{device} on {device_name})"
+    if overall is not None:
+        return f"#{overall}"
+    if device is not None and device_name:
+        return f"> 100 (#{device} on {device_name})"
+    return "> 100"
+
+
 def _get_thresholds(scores: list[dict], hw_filter: set[str] | None = None) -> dict:
     if hw_filter:
         scores = [s for s in scores if s.get("hardware", "") in hw_filter]
@@ -116,16 +168,19 @@ def _get_thresholds(scores: list[dict], hw_filter: set[str] | None = None) -> di
     }
 
 
-def _install_font(font_path: Path):
+def _install_font(font_path: Path) -> bool:
+    """Install a font file into the current process. Returns True on success."""
     if not font_path.exists():
-        return
+        return False
     path_str = str(font_path)
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.gdi32.AddFontResourceExW(path_str, 0x10, 0)
+            # FR_PRIVATE = 0x10 — process-local, no registry writes needed
+            count = ctypes.windll.gdi32.AddFontResourceExW(path_str, 0x10, 0)
+            return count > 0
         except Exception:
-            pass
+            return False
     else:
         try:
             user_fonts = Path.home() / ".local" / "share" / "fonts"
@@ -134,149 +189,330 @@ def _install_font(font_path: Path):
             if not dest.exists():
                 import shutil
                 shutil.copy2(path_str, dest)
+            return True
+        except Exception:
+            return False
+
+
+def _install_all_fonts() -> dict:
+    """Register the bundled TTFs with the OS. Must run BEFORE Tk root exists.
+    Returns {"dseg": bool, "share_tech": bool} indicating install success."""
+    dseg_ok = _install_font(_FONT_DIR / "DSEG14Classic-Regular.ttf")
+    dseg_ok = _install_font(_FONT_DIR / "DSEG14Classic-Bold.ttf") or dseg_ok
+    stm_ok = _install_font(_FONT_DIR / "ShareTechMono-Regular.ttf")
+
+    # On Windows, broadcast WM_FONTCHANGE so Tk (when it initializes) picks
+    # up the freshly registered fonts.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            HWND_BROADCAST = 0xFFFF
+            WM_FONTCHANGE = 0x001D
+            ctypes.windll.user32.PostMessageW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0)
         except Exception:
             pass
 
+    return {"dseg": dseg_ok, "share_tech": stm_ok}
 
-def _load_fonts():
+
+def _detect_installed_fonts(root):
+    """Verify the bundled fonts are visible to Tk and update the globals.
+    Must be called AFTER the Tk root has been created."""
     global TITLE_FONT_FAMILY, FONT_FAMILY
-    _install_font(_FONT_DIR / "DSEG14Classic-Bold.ttf")
-    _install_font(_FONT_DIR / "DSEG14Classic-Regular.ttf")
-    _install_font(_FONT_DIR / "ShareTechMono-Regular.ttf")
     try:
         import tkinter.font as tkfont
-        families = [f.lower() for f in tkfont.families()]
+        families = {f.lower(): f for f in tkfont.families(root=root)}
         if "dseg14 classic" in families:
-            TITLE_FONT_FAMILY = "DSEG14 Classic"
+            TITLE_FONT_FAMILY = families["dseg14 classic"]
         if "share tech mono" in families:
-            FONT_FAMILY = "Share Tech Mono"
+            FONT_FAMILY = families["share tech mono"]
     except Exception:
         pass
 
 
-# ─── Game Card Widget ───────────────────────────────────────────────
+# ─── Canvas Game List (high-performance) ──────────────────────────
 
+class CanvasGameList:
+    """Renders the game list as lightweight canvas items instead of widgets."""
 
-class GameCard(ctk.CTkFrame):
-    """A compact card showing one game's rank, score, and improvement target."""
+    THUMB_MAX_W = 68
+    THUMB_MAX_H = 68
+    CARD_H = 86
+    CARD_PAD_Y = 4
+    CARD_PAD_X = 6
+    CARD_TOTAL = CARD_H + CARD_PAD_Y * 2
+    TEXT_X_NO_IMG = 12   # text x-offset when no image
+    TEXT_X_WITH_IMG = 86  # text x-offset when image present (8 + 68 + 10)
 
-    CARD_HEIGHT = 76
-    BOXART_HEIGHT = 64
-    BOXART_WIDTH = 64  # will be replaced by actual aspect ratio
-
-    def __init__(self, parent, game_name: str, rank_str: str, score_str: str,
-                 next_target: str, gap_str: str, progress: float,
-                 boxart_image=None, accent_color: str = AMBER,
-                 on_click=None, on_right_click=None, **kwargs):
-        super().__init__(parent, fg_color=BG_CARD, corner_radius=8,
-                         border_width=2, border_color=BG_CARD,
-                         cursor="hand2", height=self.CARD_HEIGHT, **kwargs)
-
-        self._on_click = on_click
+    def __init__(self, parent, on_select, on_right_click, http_session, thumb_pool):
+        self._on_select = on_select
         self._on_right_click = on_right_click
-        self._selected = False
-        self._accent_color = accent_color
+        self._http = http_session
+        self._thumb_pool = thumb_pool
+        self._items: list[dict] = []
+        self._selected_id: str | None = None
+        self._hover_idx: int = -1
+        self._card_rects: dict[int, int] = {}  # idx -> canvas rect id
 
-        # ── Boxart thumbnail (left) — fixed height, variable width ──
-        self._boxart_label = ctk.CTkLabel(
-            self, text="", height=self.BOXART_HEIGHT,
-            fg_color=BG_DARK, corner_radius=4,
+        # Image caches — keep references to prevent GC
+        self._photo_cache: dict[str, ImageTk.PhotoImage] = {}  # url -> PhotoImage
+        self._img_canvas_ids: dict[int, int] = {}  # idx -> canvas image id
+        self._loading_urls: set[str] = set()  # urls currently being fetched
+
+        self._frame = tk.Frame(parent, bg=BG_PANEL, bd=0, highlightthickness=0)
+
+        self._canvas = tk.Canvas(
+            self._frame, bg=BG_PANEL, highlightthickness=0, bd=0,
         )
-        self._boxart_label.pack(side="left", padx=(6, 8), pady=6)
-        if boxart_image:
-            self._boxart_label.configure(image=boxart_image, text="")
-
-        # ── Right side: info stacked vertically ──
-        info = ctk.CTkFrame(self, fg_color="transparent")
-        info.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=4)
-
-        # Row 1: Game name
-        self._name_label = ctk.CTkLabel(
-            info, text=game_name, font=(FONT_FAMILY, 12, "bold"),
-            text_color=accent_color, anchor="w",
+        self._scrollbar = ctk.CTkScrollbar(
+            self._frame, command=self._canvas.yview,
+            button_color=AMBER_DIM, button_hover_color=AMBER,
         )
-        self._name_label.pack(fill="x")
+        self._canvas.configure(yscrollcommand=self._scrollbar.set)
 
-        # Row 2: Rank + Score
-        info_top = ctk.CTkFrame(info, fg_color="transparent")
-        info_top.pack(fill="x", pady=(1, 0))
+        self._scrollbar.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
 
-        ctk.CTkLabel(
-            info_top, text=f"#{rank_str}", font=(FONT_FAMILY, 11, "bold"),
-            text_color=NEON_CYAN, width=60, anchor="w",
-        ).pack(side="left")
+        self._canvas.bind("<Button-1>", self._on_click)
+        self._canvas.bind("<Button-3>", self._on_rclick)
+        self._canvas.bind("<Motion>", self._on_motion)
+        self._canvas.bind("<Leave>", self._on_leave)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._canvas.bind("<Configure>", lambda e: self._redraw())
 
-        ctk.CTkLabel(
-            info_top, text=score_str, font=(FONT_FAMILY, 11),
-            text_color=NEON_YELLOW, anchor="w",
-        ).pack(side="left")
+        self._last_width: int = 0
 
-        if gap_str:
-            gap_color = NEON_GREEN if progress >= 0.9 else (
-                NEON_ORANGE if progress >= 0.7 else NEON_PINK)
-            ctk.CTkLabel(
-                info_top, text=gap_str, font=(FONT_FAMILY, 10, "bold"),
-                text_color=gap_color, anchor="e",
-            ).pack(side="right")
+    def pack(self, **kwargs):
+        self._frame.pack(**kwargs)
 
-        # Row 3: Target + Progress bar
-        if next_target or progress > 0:
-            bottom = ctk.CTkFrame(info, fg_color="transparent")
-            bottom.pack(fill="x", pady=(2, 0))
+    def set_items(self, items: list[dict]):
+        """Set items and redraw. Each item dict has keys:
+        gid, name, rank_str, score_str, target, gap_str, progress, accent,
+        boxart_url (optional)"""
+        self._items = items
+        self._hover_idx = -1
+        self._redraw()
+        self._load_visible_thumbs()
 
-            if next_target:
-                ctk.CTkLabel(
-                    bottom, text=f"→ {next_target}", font=(FONT_FAMILY, 9),
-                    text_color=FG_DIM, anchor="w", width=60,
-                ).pack(side="left")
+    def set_selected(self, game_id: str | None):
+        old = self._selected_id
+        self._selected_id = game_id
+        old_idx = self._idx_for_gid(old) if old else -1
+        new_idx = self._idx_for_gid(game_id) if game_id else -1
+        if old_idx >= 0:
+            self._update_card_bg(old_idx)
+        if new_idx >= 0:
+            self._update_card_bg(new_idx)
 
-            if progress > 0:
-                bar_color = NEON_GREEN if progress >= 0.9 else (
-                    NEON_ORANGE if progress >= 0.7 else NEON_PINK)
-                self._progress = ctk.CTkProgressBar(
-                    bottom, height=5, corner_radius=2,
-                    fg_color=BG_DARK, progress_color=bar_color,
+    def _idx_for_gid(self, gid: str) -> int:
+        for i, item in enumerate(self._items):
+            if item["gid"] == gid:
+                return i
+        return -1
+
+    def _text_x(self, item: dict, x0: int) -> int:
+        """Return the x offset for text, depending on whether boxart url exists."""
+        if item.get("boxart_url", ""):
+            return x0 + self.TEXT_X_WITH_IMG
+        return x0 + self.TEXT_X_NO_IMG
+
+    def _redraw(self):
+        w = self._canvas.winfo_width()
+        if w < 10:
+            w = 350
+        self._last_width = w
+        self._canvas.delete("all")
+        self._card_rects.clear()
+        self._img_canvas_ids.clear()
+
+        for i, item in enumerate(self._items):
+            y = i * self.CARD_TOTAL + self.CARD_PAD_Y
+            x0 = self.CARD_PAD_X
+            x1 = w - self.CARD_PAD_X
+            is_sel = item["gid"] == self._selected_id
+            is_hover = i == self._hover_idx
+            accent = item.get("accent", AMBER)
+
+            bg = BG_CARD_SELECTED if is_sel else (BG_CARD_HOVER if is_hover else BG_CARD)
+            border = accent if is_sel else (BG_HEADER if is_hover else BG_CARD)
+
+            rect = self._canvas.create_rectangle(
+                x0, y, x1, y + self.CARD_H,
+                fill=bg, outline=border, width=2,
+            )
+            self._card_rects[i] = rect
+
+            # Boxart thumbnail (if cached)
+            url = item.get("boxart_url", "")
+            if url and url in self._photo_cache:
+                img_id = self._canvas.create_image(
+                    x0 + 8, y + 8, anchor="nw",
+                    image=self._photo_cache[url],
                 )
-                self._progress.set(min(progress, 1.0))
-                self._progress.pack(side="left", fill="x", expand=True, padx=(4, 0))
+                self._img_canvas_ids[i] = img_id
 
-        # Bind clicks on all child widgets
-        self._bind_all(self)
+            tx = self._text_x(item, x0)
+            kind = item.get("kind", "game")
 
-    def _bind_all(self, widget):
-        widget.bind("<Button-1>", self._click)
-        widget.bind("<Button-3>", self._right_click)
-        for child in widget.winfo_children():
-            self._bind_all(child)
+            # Title (row 1)
+            self._canvas.create_text(
+                tx, y + 10, text=item["name"], anchor="nw",
+                fill=accent, font=(FONT_FAMILY, 14, "bold"),
+                width=x1 - tx - 12,
+            )
 
-    def set_boxart(self, image):
-        """Update boxart after async load."""
-        if image:
-            self._boxart_label.configure(image=image, text="")
+            if kind == "tournament":
+                # Row 2: Status (colored) + Dates
+                status_text = item.get("status", "")
+                status_color = item.get("status_color", NEON_CYAN)
+                self._canvas.create_text(
+                    tx, y + 36, text=status_text, anchor="nw",
+                    fill=status_color, font=(FONT_FAMILY, 13, "bold"),
+                )
+                if item.get("dates"):
+                    self._canvas.create_text(
+                        tx + 84, y + 36, text=item["dates"], anchor="nw",
+                        fill=FG_DEFAULT, font=(FONT_FAMILY, 12),
+                    )
+                # User's best rank (right-aligned)
+                if item.get("user_rank_str"):
+                    self._canvas.create_text(
+                        x1 - 10, y + 36, text=item["user_rank_str"], anchor="ne",
+                        fill=NEON_YELLOW, font=(FONT_FAMILY, 12, "bold"),
+                    )
+                # Row 3: subtitle (e.g. "5 games")
+                if item.get("subtitle"):
+                    self._canvas.create_text(
+                        tx, y + 62, text=item["subtitle"], anchor="nw",
+                        fill=AMBER_DIM, font=(FONT_FAMILY, 12),
+                    )
+            else:
+                # Row 2: Rank (full format) + Gap (right-aligned)
+                self._canvas.create_text(
+                    tx, y + 36, text=item['rank_str'], anchor="nw",
+                    fill=NEON_CYAN, font=(FONT_FAMILY, 13, "bold"),
+                )
+                if item["gap_str"]:
+                    self._canvas.create_text(
+                        x1 - 10, y + 36, text=item["gap_str"], anchor="ne",
+                        fill=NEON_ORANGE, font=(FONT_FAMILY, 12, "bold"),
+                    )
 
-    def _click(self, event=None):
-        if self._on_click:
-            self._on_click()
+                # Row 3: Score (left) + Next Target (right, dim)
+                if item["score_str"]:
+                    self._canvas.create_text(
+                        tx, y + 62, text=item["score_str"], anchor="nw",
+                        fill=NEON_YELLOW, font=(FONT_FAMILY, 13),
+                    )
+                if item["target"]:
+                    target_text = f"→ {item['target']}"
+                    if item.get("target_score"):
+                        target_text += f"  [{item['target_score']}]"
+                    self._canvas.create_text(
+                        x1 - 10, y + 62, text=target_text, anchor="ne",
+                        fill=AMBER_DIM, font=(FONT_FAMILY, 12),
+                    )
 
-    def _right_click(self, event=None):
-        if self._on_right_click and event:
-            self._on_right_click(event)
+        total_h = max(len(self._items) * self.CARD_TOTAL + self.CARD_PAD_Y, 1)
+        self._canvas.configure(scrollregion=(0, 0, w, total_h))
 
-    def set_selected(self, selected: bool):
-        self._selected = selected
-        if selected:
-            self.configure(fg_color=BG_CARD_SELECTED,
-                           border_color=self._accent_color)
-        else:
-            self.configure(fg_color=BG_CARD, border_color=BG_CARD)
+    # ── Thumbnail loading ──────────────────────────────────────
 
-    def on_enter(self, event=None):
-        if not self._selected:
-            self.configure(fg_color=BG_CARD_HOVER, border_color=BG_HEADER)
+    def _load_visible_thumbs(self):
+        """Kick off async loads for all items that have a boxart_url."""
+        for item in self._items:
+            url = item.get("boxart_url", "")
+            if not url or url in self._photo_cache or url in self._loading_urls:
+                continue
+            self._loading_urls.add(url)
+            self._thumb_pool.submit(self._fetch_thumb, url)
 
-    def on_leave(self, event=None):
-        if not self._selected:
-            self.configure(fg_color=BG_CARD, border_color=BG_CARD)
+    def _fetch_thumb(self, url: str):
+        """Download and resize a thumbnail (runs in thread pool)."""
+        try:
+            resp = self._http.get(url, timeout=8)
+            resp.raise_for_status()
+            pil = Image.open(io.BytesIO(resp.content))
+            # Fit into bounding box, preserving aspect ratio
+            max_w, max_h = self.THUMB_MAX_W, self.THUMB_MAX_H
+            scale = min(max_w / pil.width, max_h / pil.height)
+            w = int(pil.width * scale)
+            h = int(pil.height * scale)
+            pil = pil.resize((w, h), Image.LANCZOS)
+            self._canvas.after(0, lambda: self._on_thumb_loaded(url, pil))
+        except Exception:
+            self._loading_urls.discard(url)
+
+    def _on_thumb_loaded(self, url: str, pil_img):
+        """Called on main thread when a thumbnail is ready."""
+        self._loading_urls.discard(url)
+        try:
+            photo = ImageTk.PhotoImage(pil_img)
+            self._photo_cache[url] = photo
+        except Exception:
+            return
+
+        # Schedule a single coalesced redraw instead of one per thumbnail
+        if not hasattr(self, "_redraw_pending") or self._redraw_pending is None:
+            self._redraw_pending = self._canvas.after(100, self._coalesced_redraw)
+
+    def _coalesced_redraw(self):
+        """Batch redraw after thumbnails have loaded."""
+        self._redraw_pending = None
+        self._redraw()
+
+    # ── Card background updates ────────────────────────────────
+
+    def _update_card_bg(self, idx: int):
+        """Update only the background rect of one card (no full redraw)."""
+        rect_id = self._card_rects.get(idx)
+        if rect_id is None:
+            return
+        item = self._items[idx]
+        accent = item.get("accent", AMBER)
+        is_sel = item["gid"] == self._selected_id
+        is_hover = idx == self._hover_idx
+
+        bg = BG_CARD_SELECTED if is_sel else (BG_CARD_HOVER if is_hover else BG_CARD)
+        border = accent if is_sel else (BG_HEADER if is_hover else BG_CARD)
+        self._canvas.itemconfigure(rect_id, fill=bg, outline=border)
+
+    def _idx_at_y(self, y: int) -> int:
+        canvas_y = self._canvas.canvasy(y)
+        idx = int(canvas_y // self.CARD_TOTAL)
+        if 0 <= idx < len(self._items):
+            return idx
+        return -1
+
+    def _on_click(self, event):
+        idx = self._idx_at_y(event.y)
+        if idx >= 0:
+            self.set_selected(self._items[idx]["gid"])
+            self._on_select(self._items[idx]["gid"])
+
+    def _on_rclick(self, event):
+        idx = self._idx_at_y(event.y)
+        if idx >= 0:
+            self._on_right_click(event, self._items[idx]["gid"])
+
+    def _on_motion(self, event):
+        idx = self._idx_at_y(event.y)
+        if idx != self._hover_idx:
+            old = self._hover_idx
+            self._hover_idx = idx
+            if old >= 0:
+                self._update_card_bg(old)
+            if idx >= 0:
+                self._update_card_bg(idx)
+
+    def _on_leave(self, event):
+        if self._hover_idx >= 0:
+            old = self._hover_idx
+            self._hover_idx = -1
+            self._update_card_bg(old)
+
+    def _on_mousewheel(self, event):
+        self._canvas.yview_scroll(-1 * (event.delta // 120), "units")
 
 
 # ─── Main Application ──────────────────────────────────────────────
@@ -284,12 +520,20 @@ class GameCard(ctk.CTkFrame):
 
 class ScoreChaserApp:
     def __init__(self):
-        _load_fonts()
+        # Register TTF files with the OS before Tk initializes — Tk reads
+        # the Windows font table once, so fonts added afterwards are often
+        # invisible to it.
+        _install_all_fonts()
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
         self.root = ctk.CTk()
+        # Now that Tk exists, resolve the actual family names it can see
+        # and update the FONT_FAMILY / TITLE_FONT_FAMILY globals before
+        # any widget is built.
+        _detect_installed_fonts(self.root)
+
         self.root.title("ScoreChaser - ATGames Leaderboards")
         self.root.geometry("1400x800")
         self.root.minsize(1000, 600)
@@ -306,19 +550,34 @@ class ScoreChaserApp:
                 pass
 
         self.data: dict = {}
-        self._image_cache: dict[str, ImageTk.PhotoImage] = {}
-        self._thumb_cache: dict[str, ctk.CTkImage] = {}
+        self._image_cache: dict[tuple, ctk.CTkImage] = {}
         self._http = requests.Session()
         self._http.headers.update({"User-Agent": "ScoreChaser/1.0"})
 
         self._token: str | None = None
-        self._personal_scores: list[dict] = []
+        self._personal_scores: list[dict] = load_personal_scores()
         self._hidden_games: set[str] = set()
         self._load_hidden_games()
 
         self._selected_game_id: str | None = None
-        self._game_cards: dict[str, GameCard] = {}
-        self._current_view = "my"  # "my" or "all"
+        self._current_view = "my"  # "my", "all", or "tournaments"
+
+        # Tournament state (hydrate from disk cache)
+        _tcache = load_tournaments_cache()
+        self._tournaments: list[dict] = _tcache["tournaments"]
+        self._tournament_scores_cache: dict[int, list[dict]] = {
+            int(k): v for k, v in _tcache["scores"].items() if str(k).isdigit()
+        }
+        self._selected_tournament_id: int | None = None
+        self._tournaments_loaded: bool = bool(self._tournaments)
+
+        # Performance: debounce refresh, pool for async work
+        self._refresh_pending: str | None = None
+        self._thumb_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
+
+        # Snapshot-based change tracking (last session → current)
+        self._prev_snapshot: dict = load_snapshot()
+        self._pending_compare: bool = False
 
         self._build_ui()
         self._load_token()
@@ -332,22 +591,30 @@ class ScoreChaserApp:
 
     def _build_ui(self):
         # Top bar
-        top = ctk.CTkFrame(self.root, fg_color=BG_PANEL, height=50, corner_radius=0)
+        top = ctk.CTkFrame(self.root, fg_color=BG_PANEL, height=56, corner_radius=0)
         top.pack(fill="x")
         top.pack_propagate(False)
 
+        title_box = ctk.CTkFrame(top, fg_color="transparent")
+        title_box.pack(side="left", padx=(16, 24))
         ctk.CTkLabel(
-            top, text="SCORE CHASER", font=(TITLE_FONT_FAMILY, 18),
-            text_color=AMBER,
-        ).pack(side="left", padx=(16, 24))
+            title_box, text="SCORE CHASER",
+            font=(TITLE_FONT_FAMILY, 20), text_color=AMBER,
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            title_box, text="for ATGames Pinball",
+            font=(FONT_FAMILY, 10), text_color=FG_DIM,
+            anchor="w",
+        ).pack(anchor="w", pady=(0, 0))
 
         # Device filter
-        ctk.CTkLabel(top, text="DEVICE", font=(FONT_FAMILY, 9),
+        ctk.CTkLabel(top, text="DEVICE", font=(FONT_FAMILY, 13),
                      text_color=FG_DIM).pack(side="left")
         self._hw_var = tk.StringVar(value="All Devices")
         self._hw_combo = ctk.CTkComboBox(
             top, variable=self._hw_var, values=["All Devices"],
-            width=150, font=(FONT_FAMILY, 11), state="readonly",
+            width=150, font=(FONT_FAMILY, 13), state="readonly",
             fg_color=BG_CARD, border_color=BG_HEADER,
             button_color=AMBER_DIM, button_hover_color=AMBER,
             dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
@@ -357,14 +624,14 @@ class ScoreChaserApp:
 
         # Login area (right side)
         self._login_btn = ctk.CTkButton(
-            top, text="LOGIN", width=80, font=(FONT_FAMILY, 11, "bold"),
+            top, text="LOGIN", width=80, font=(FONT_FAMILY, 13, "bold"),
             fg_color=BG_CARD, hover_color=BG_CARD_HOVER,
             text_color=NEON_ORANGE, command=self._start_login,
         )
         self._login_btn.pack(side="right", padx=(8, 16))
 
         self._login_label = ctk.CTkLabel(
-            top, text="", font=(FONT_FAMILY, 10), text_color=FG_DIM,
+            top, text="", font=(FONT_FAMILY, 12), text_color=FG_DIM,
         )
         self._login_label.pack(side="right")
 
@@ -384,8 +651,8 @@ class ScoreChaserApp:
         left_header.pack(fill="x", padx=8, pady=(8, 4))
 
         self._view_toggle = ctk.CTkSegmentedButton(
-            left_header, values=["MY GAMES", "ALL GAMES"],
-            font=(FONT_FAMILY, 10, "bold"),
+            left_header, values=["MY GAMES", "ALL GAMES", "TOURNAMENTS"],
+            font=(FONT_FAMILY, 12, "bold"),
             fg_color=BG_DARK, selected_color=AMBER_DIM,
             selected_hover_color=AMBER, unselected_color=BG_CARD,
             unselected_hover_color=BG_CARD_HOVER,
@@ -395,31 +662,33 @@ class ScoreChaserApp:
         self._view_toggle.set("MY GAMES")
         self._view_toggle.pack(side="left")
 
-        self._sort_var = tk.StringVar(value="Potential")
+        self._sort_var = tk.StringVar(value="Rank")
         self._sort_combo = ctk.CTkComboBox(
             left_header, variable=self._sort_var,
-            values=["Potential", "Rank", "Name", "Score"],
-            width=110, font=(FONT_FAMILY, 10), state="readonly",
+            values=["Rank", "Name", "Score"],
+            width=110, font=(FONT_FAMILY, 12), state="readonly",
             fg_color=BG_CARD, border_color=BG_HEADER,
             button_color=AMBER_DIM, button_hover_color=AMBER,
             dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
             command=lambda _: self._refresh_list(),
         )
         self._sort_combo.pack(side="right")
-        ctk.CTkLabel(left_header, text="Sort:", font=(FONT_FAMILY, 9),
+        ctk.CTkLabel(left_header, text="Sort:", font=(FONT_FAMILY, 13),
                      text_color=FG_DIM).pack(side="right", padx=(0, 4))
 
         # Game count label
         self._count_label = ctk.CTkLabel(
-            left, text="", font=(FONT_FAMILY, 9), text_color=FG_DIM,
+            left, text="", font=(FONT_FAMILY, 13), text_color=FG_DIM,
         )
         self._count_label.pack(fill="x", padx=12, pady=(0, 4))
 
-        # Scrollable game list
-        self._game_list = ctk.CTkScrollableFrame(
-            left, fg_color=BG_PANEL, corner_radius=0,
-            scrollbar_button_color=AMBER_DIM,
-            scrollbar_button_hover_color=AMBER,
+        # Scrollable game list (canvas-based for performance)
+        self._game_list = CanvasGameList(
+            left,
+            on_select=self._select_game,
+            on_right_click=self._show_card_menu,
+            http_session=self._http,
+            thumb_pool=self._thumb_pool,
         )
         self._game_list.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
@@ -433,7 +702,7 @@ class ScoreChaserApp:
 
         self._detail_placeholder = ctk.CTkLabel(
             self._detail_panel, text="Select a game",
-            font=(TITLE_FONT_FAMILY, 14), text_color=FG_DIM,
+            font=(TITLE_FONT_FAMILY, 16), text_color=FG_DIM,
         )
         self._detail_placeholder.pack(pady=40)
 
@@ -443,7 +712,7 @@ class ScoreChaserApp:
         status.pack_propagate(False)
 
         self._status_label = ctk.CTkLabel(
-            status, text="No data loaded.", font=(FONT_FAMILY, 9),
+            status, text="No data loaded.", font=(FONT_FAMILY, 13),
             text_color=FG_DIM, anchor="w",
         )
         self._status_label.pack(side="left", padx=8)
@@ -456,7 +725,7 @@ class ScoreChaserApp:
 
         self._refresh_btn = ctk.CTkButton(
             status, text="REFRESH", width=80, height=26,
-            font=(FONT_FAMILY, 10, "bold"),
+            font=(FONT_FAMILY, 12, "bold"),
             fg_color=BG_CARD, hover_color=BG_CARD_HOVER,
             text_color=NEON_ORANGE, command=self._start_scrape,
         )
@@ -464,7 +733,7 @@ class ScoreChaserApp:
 
         self._hidden_btn = ctk.CTkButton(
             status, text="Hidden (0)", width=90, height=26,
-            font=(FONT_FAMILY, 10), fg_color=BG_CARD,
+            font=(FONT_FAMILY, 12), fg_color=BG_CARD,
             hover_color=BG_CARD_HOVER, text_color=FG_DIM,
             command=self._show_hidden_dialog,
         )
@@ -473,7 +742,7 @@ class ScoreChaserApp:
         self._ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=FG_DEFAULT,
                                   activebackground=AMBER_DIM,
                                   activeforeground=AMBER_BRIGHT,
-                                  font=(FONT_FAMILY, 10))
+                                  font=(FONT_FAMILY, 12))
         self._ctx_menu.add_command(label="Hide game", command=self._ctx_hide_game)
         self._ctx_game_id: str | None = None
 
@@ -481,7 +750,7 @@ class ScoreChaserApp:
         self._lb_ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=FG_DEFAULT,
                                      activebackground=AMBER_DIM,
                                      activeforeground=AMBER_BRIGHT,
-                                     font=(FONT_FAMILY, 10))
+                                     font=(FONT_FAMILY, 12))
         self._lb_ctx_menu.add_command(label="Search this user",
                                        command=self._ctx_search_user)
         self._lb_ctx_username: str | None = None
@@ -498,11 +767,42 @@ class ScoreChaserApp:
         else:
             self._status_label.configure(text="No data. Loading...")
         self.root.after(100, self._start_scrape)
-        self.root.after(200, self._load_tournaments)
+        # Always refresh tournaments in background — needed for popup diffs
+        self.root.after(300, self._load_tournaments)
 
     def _load_tournaments(self):
-        # Keep tournament data for potential future use
-        pass
+        """Fetch tournaments + pre-cache scores in background."""
+        def do_fetch():
+            try:
+                tournaments = fetch_tournaments()
+                for t in tournaments:
+                    tid = t.get("id")
+                    if tid is None or tid in self._tournament_scores_cache:
+                        continue
+                    try:
+                        scores = fetch_tournament_scores(tid)
+                        self._tournament_scores_cache[tid] = scores
+                    except Exception:
+                        pass
+                self.root.after(0, lambda: self._on_tournaments_loaded(tournaments))
+            except Exception:
+                pass
+
+        self._thumb_pool.submit(do_fetch)
+
+    def _on_tournaments_loaded(self, tournaments: list[dict]):
+        self._tournaments = tournaments
+        self._tournaments_loaded = True
+        try:
+            save_tournaments_cache(self._tournaments,
+                                    self._tournament_scores_cache)
+        except Exception:
+            pass
+        if self._current_view == "tournaments":
+            self._refresh_list()
+        # Tournament data changed — re-check snapshot for new popup items
+        if self._pending_compare or self.data:
+            self._maybe_compare_snapshot()
 
     def _load_hidden_games(self):
         settings = load_settings()
@@ -553,6 +853,10 @@ class ScoreChaserApp:
         if self._token:
             self._token = None
             self._personal_scores.clear()
+            try:
+                save_personal_scores([])
+            except Exception:
+                pass
             self._save_token(None)
             self._login_btn.configure(text="LOGIN")
             self._login_label.configure(text="", text_color=FG_DIM)
@@ -604,8 +908,15 @@ class ScoreChaserApp:
 
     def _on_personal_scores(self, scores):
         self._personal_scores = scores
+        try:
+            save_personal_scores(scores)
+        except Exception:
+            pass
         self._backfill_missing_games()
         self._refresh_list()
+        if self._pending_compare:
+            self._pending_compare = False
+            self._do_compare_and_popup()
 
     def _backfill_missing_games(self):
         if not self._personal_scores:
@@ -673,6 +984,7 @@ class ScoreChaserApp:
         self._update_hw_options()
         self._backfill_missing_games()
         self._refresh_list()
+        self._maybe_compare_snapshot()
 
     def _on_scrape_error(self, error):
         self._progress_bar.pack_forget()
@@ -697,7 +1009,14 @@ class ScoreChaserApp:
     # ── View Toggle ─────────────────────────────────────────────
 
     def _on_view_toggle(self, value):
-        self._current_view = "my" if value == "MY GAMES" else "all"
+        if value == "MY GAMES":
+            self._current_view = "my"
+        elif value == "ALL GAMES":
+            self._current_view = "all"
+        else:
+            self._current_view = "tournaments"
+            if not self._tournaments_loaded:
+                self._load_tournaments()
         self._refresh_list()
 
     # ── Game List ───────────────────────────────────────────────
@@ -718,14 +1037,347 @@ class ScoreChaserApp:
             }
         return pmap
 
-    def _compute_target(self, user_score: int, thresholds: dict) -> tuple:
-        """Returns (next_target_label, gap_str, progress)."""
-        milestones = [
-            (100, "Top 100", "top100"),
-            (50, "Top 50", "top50"),
-            (10, "Top 10", "top10"),
-            (1, "#1", "high"),
-        ]
+    def _resolve_user_ranks(self, scores: list[dict], entry: dict | None,
+                             in_top100: bool, search: str) -> tuple:
+        """Compute (overall_rank, device_rank, device_name) for the user.
+
+        overall_rank: position in the full top-100 leaderboard, or None if
+            the user is beyond top 100.
+        device_rank: position among entries sharing the user's hardware
+            group, computed from top 100 when the user is in it, else from
+            their personal-score rank (assumed device-specific).
+        device_name: friendly hardware group name (e.g. "Pinball 4K").
+        """
+        if not entry:
+            return None, None, ""
+
+        hw_code = entry.get("hardware", "")
+        device_name = _hw_name(hw_code) if hw_code else ""
+        device_group = _HW_GROUPS.get(device_name) if device_name else None
+
+        overall_rank = entry.get("rank") if in_top100 else None
+
+        device_rank = None
+        if in_top100 and device_group and search:
+            same_device = [
+                s for s in scores
+                if s.get("hardware", "") in device_group
+            ]
+            same_device.sort(
+                key=lambda s: int(float(s.get("score", "0") or "0")),
+                reverse=True,
+            )
+            for i, s in enumerate(same_device):
+                if s.get("userName", "").lower() == search:
+                    device_rank = i + 1
+                    break
+        elif not in_top100:
+            # Beyond top 100 — fall back to whatever rank the API gave us
+            # via personal_scores (expected to be device-specific).
+            r = entry.get("rank")
+            if isinstance(r, int) and r > 0:
+                device_rank = r
+
+        return overall_rank, device_rank, device_name
+
+    # ── Snapshot & Change Detection ─────────────────────────────
+
+    def _compute_snapshot(self) -> dict:
+        """Build a snapshot of the current user state (games + tournaments)."""
+        snapshot: dict = {}
+        search = get_token_username(self._token).lower() if self._token else ""
+        if not search:
+            return snapshot
+
+        personal_map = self._get_personal_map()
+
+        # Games
+        for gid, game in self.data.items():
+            entry = None
+            in_top100 = False
+            for s in game.get("scores", []):
+                if search == s.get("userName", "").lower():
+                    entry = s
+                    in_top100 = True
+                    break
+            if entry is None and gid in personal_map:
+                entry = personal_map[gid]
+            if not entry:
+                continue
+
+            try:
+                score = int(float(entry.get("score", "0")))
+            except (ValueError, TypeError):
+                score = 0
+            snapshot[gid] = {
+                "type": "game",
+                "name": game.get("name", ""),
+                "score": score,
+                "rank": entry.get("rank") if in_top100 else None,
+            }
+
+        # Tournaments — one entry per (tournament, game) where user has a score
+        for t in self._tournaments:
+            tid = t.get("id")
+            if tid is None:
+                continue
+            games = self._tournament_scores_cache.get(tid, [])
+            for g in games:
+                game_name = g.get("name", "")
+                for s in g.get("scores", []):
+                    if search != s.get("userName", "").lower():
+                        continue
+                    try:
+                        score = int(float(s.get("score", "0")))
+                    except (ValueError, TypeError):
+                        score = 0
+                    key = f"t:{tid}:{game_name}"
+                    snapshot[key] = {
+                        "type": "tournament",
+                        "name": game_name,
+                        "tournament_name": t.get("name", ""),
+                        "score": score,
+                        "rank": s.get("rank"),
+                    }
+                    break
+        return snapshot
+
+    def _compute_changes(self, old: dict, new: dict) -> tuple[list, list]:
+        """Return (improvements, overtaken) by diffing old vs new snapshots."""
+        improvements = []
+        overtaken = []
+
+        for gid, new_e in new.items():
+            if gid not in old:
+                continue
+            old_e = old[gid]
+            old_score = old_e.get("score", 0)
+            new_score = new_e.get("score", 0)
+            old_rank = old_e.get("rank")
+            new_rank = new_e.get("rank")
+
+            score_diff = new_score - old_score
+
+            rank_improved = False
+            rank_worsened = False
+            rank_diff = 0
+            if old_rank is not None and new_rank is not None:
+                rank_diff = old_rank - new_rank
+                rank_improved = rank_diff > 0
+                rank_worsened = rank_diff < 0
+            elif old_rank is None and new_rank is not None:
+                rank_improved = True  # entered Top 100
+            elif old_rank is not None and new_rank is None:
+                rank_worsened = True  # dropped out
+
+            entry_type = new_e.get("type", "game")
+            tournament_name = new_e.get("tournament_name", "")
+
+            if score_diff > 0 or rank_improved:
+                improvements.append({
+                    "type": entry_type,
+                    "tournament_name": tournament_name,
+                    "name": new_e["name"],
+                    "old_score": old_score,
+                    "new_score": new_score,
+                    "score_diff": score_diff,
+                    "old_rank": old_rank,
+                    "new_rank": new_rank,
+                    "rank_diff": rank_diff,
+                })
+            elif rank_worsened:
+                overtaken.append({
+                    "type": entry_type,
+                    "tournament_name": tournament_name,
+                    "name": new_e["name"],
+                    "old_rank": old_rank,
+                    "new_rank": new_rank,
+                    "rank_diff": -rank_diff if rank_diff else 0,
+                })
+
+        # Sort: largest score/rank improvements first
+        improvements.sort(key=lambda x: (-x["score_diff"], -x["rank_diff"]))
+        overtaken.sort(key=lambda x: -x["rank_diff"])
+        return improvements, overtaken
+
+    def _maybe_compare_snapshot(self):
+        """Called after scrape completes. Defer if personal scores not ready."""
+        if not self._token:
+            # Not logged in — no personal state to compare
+            return
+        if not self._personal_scores:
+            # Defer until personal scores arrive
+            self._pending_compare = True
+            return
+        self._do_compare_and_popup()
+
+    def _do_compare_and_popup(self):
+        """Compute snapshot, compare to previous, show popup if changes exist."""
+        new_snapshot = self._compute_snapshot()
+        if not new_snapshot:
+            return
+
+        if self._prev_snapshot:
+            improvements, overtaken = self._compute_changes(
+                self._prev_snapshot, new_snapshot)
+            if improvements or overtaken:
+                self._show_changes_popup(improvements, overtaken)
+
+        self._prev_snapshot = new_snapshot
+        try:
+            save_snapshot(new_snapshot)
+        except Exception:
+            pass
+
+    def _show_changes_popup(self, improvements: list, overtaken: list):
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Score Update")
+        dlg.geometry("560x560")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.configure(fg_color=BG_PANEL)
+
+        ctk.CTkLabel(
+            dlg, text="UPDATE SINCE LAST SESSION",
+            font=(TITLE_FONT_FAMILY, 16), text_color=AMBER,
+        ).pack(pady=(16, 6))
+
+        quote = random.choice(MOTIVATING_QUOTES)
+        ctk.CTkLabel(
+            dlg, text=f'"{quote}"', font=(FONT_FAMILY, 12, "italic"),
+            text_color=NEON_YELLOW, wraplength=500, justify="center",
+        ).pack(pady=(0, 10), padx=20)
+
+        ctk.CTkFrame(dlg, fg_color=NEON_PINK, height=2).pack(
+            fill="x", padx=16, pady=4)
+
+        scroll = ctk.CTkScrollableFrame(
+            dlg, fg_color=BG_DARK,
+            scrollbar_button_color=AMBER_DIM,
+            scrollbar_button_hover_color=AMBER,
+        )
+        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+
+        def _ceiling(is_tournament: bool) -> tuple[int, str]:
+            # Leaderboard size — tournaments use Top 50, games use Top 100
+            return (50, "Top 50") if is_tournament else (100, "Top 100")
+
+        def _header_text(entry) -> tuple[str, str]:
+            """Returns (title, subtitle) for a change entry."""
+            if entry.get("type") == "tournament":
+                return entry["name"], f"Tournament: {entry.get('tournament_name', '')}"
+            return entry["name"], ""
+
+        if improvements:
+            ctk.CTkLabel(
+                scroll, text=f"▲ IMPROVEMENTS ({len(improvements)})",
+                font=(FONT_FAMILY, 14, "bold"),
+                text_color=NEON_GREEN, anchor="w",
+            ).pack(fill="x", pady=(6, 4), padx=4)
+
+            for imp in improvements:
+                is_t = imp.get("type") == "tournament"
+                ceiling, ceiling_label = _ceiling(is_t)
+                title, subtitle = _header_text(imp)
+
+                row = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=4)
+                row.pack(fill="x", pady=2, padx=4)
+                ctk.CTkLabel(
+                    row, text=title, font=(FONT_FAMILY, 13, "bold"),
+                    text_color=AMBER_BRIGHT, anchor="w",
+                ).pack(fill="x", padx=8, pady=(6, 0))
+                if subtitle:
+                    ctk.CTkLabel(
+                        row, text=subtitle, font=(FONT_FAMILY, 13),
+                        text_color=NEON_CYAN, anchor="w",
+                    ).pack(fill="x", padx=8)
+
+                if imp["score_diff"] > 0:
+                    txt = (f"{_format_score(str(imp['old_score']))}"
+                           f"  →  {_format_score(str(imp['new_score']))}"
+                           f"   (+{_format_score(str(imp['score_diff']))} pts)")
+                    ctk.CTkLabel(
+                        row, text=txt, font=(FONT_FAMILY, 12),
+                        text_color=NEON_GREEN, anchor="w",
+                    ).pack(fill="x", padx=8, pady=1)
+
+                if imp["rank_diff"] > 0:
+                    old_r = f"#{imp['old_rank']}" if imp['old_rank'] else f"> {ceiling}"
+                    new_r = f"#{imp['new_rank']}" if imp['new_rank'] else f"> {ceiling}"
+                    txt = f"Rank: {old_r}  →  {new_r}   (+{imp['rank_diff']} places)"
+                    ctk.CTkLabel(
+                        row, text=txt, font=(FONT_FAMILY, 12),
+                        text_color=NEON_CYAN, anchor="w",
+                    ).pack(fill="x", padx=8, pady=(1, 6))
+                elif imp["old_rank"] is None and imp["new_rank"] is not None:
+                    txt = f"Entered {ceiling_label} — now #{imp['new_rank']}!"
+                    ctk.CTkLabel(
+                        row, text=txt, font=(FONT_FAMILY, 12, "bold"),
+                        text_color=GOLD, anchor="w",
+                    ).pack(fill="x", padx=8, pady=(1, 6))
+                else:
+                    ctk.CTkLabel(row, text="", height=1).pack()
+
+        if overtaken:
+            ctk.CTkLabel(
+                scroll, text=f"▼ OVERTAKEN ({len(overtaken)})",
+                font=(FONT_FAMILY, 14, "bold"),
+                text_color=NEON_PINK, anchor="w",
+            ).pack(fill="x", pady=(14, 4), padx=4)
+
+            for ot in overtaken:
+                is_t = ot.get("type") == "tournament"
+                ceiling, ceiling_label = _ceiling(is_t)
+                title, subtitle = _header_text(ot)
+
+                row = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=4)
+                row.pack(fill="x", pady=2, padx=4)
+                ctk.CTkLabel(
+                    row, text=title, font=(FONT_FAMILY, 13, "bold"),
+                    text_color=AMBER_BRIGHT, anchor="w",
+                ).pack(fill="x", padx=8, pady=(6, 0))
+                if subtitle:
+                    ctk.CTkLabel(
+                        row, text=subtitle, font=(FONT_FAMILY, 13),
+                        text_color=NEON_CYAN, anchor="w",
+                    ).pack(fill="x", padx=8)
+
+                old_r = f"#{ot['old_rank']}" if ot['old_rank'] else f"> {ceiling}"
+                new_r = f"#{ot['new_rank']}" if ot['new_rank'] else f"> {ceiling}"
+                if ot['new_rank'] is None and ot['old_rank'] is not None:
+                    txt = f"Fell out of {ceiling_label}  (was {old_r})"
+                else:
+                    txt = f"Rank: {old_r}  →  {new_r}   (-{ot['rank_diff']} places)"
+                ctk.CTkLabel(
+                    row, text=txt, font=(FONT_FAMILY, 12),
+                    text_color=NEON_PINK, anchor="w",
+                ).pack(fill="x", padx=8, pady=(1, 6))
+
+        ctk.CTkButton(
+            dlg, text="KEEP PLAYING", width=160, height=34,
+            font=(FONT_FAMILY, 13, "bold"),
+            fg_color=AMBER_DIM, hover_color=AMBER,
+            text_color=BG_DARK, command=dlg.destroy,
+        ).pack(pady=(0, 14))
+
+    # Default game tiers (top 100/50/10/#1)
+    _GAME_TIERS = [
+        (100, "Enter Top 100", "top100"),
+        (50, "Enter Top 50", "top50"),
+        (10, "Enter Top 10", "top10"),
+        (1, "Become #1", "high"),
+    ]
+    # Tournament tiers — tournaments expose only top 50
+    _TOURNAMENT_TIERS = [
+        (50, "Enter Top 50", "top50"),
+        (10, "Enter Top 10", "top10"),
+        (1, "Become #1", "high"),
+    ]
+
+    def _compute_target(self, user_score: int, thresholds: dict,
+                         tiers: list | None = None) -> tuple:
+        """Returns (next_target_label, gap_str, target_score_str, progress)."""
+        milestones = tiers if tiers is not None else self._GAME_TIERS
         for rank, label, key in milestones:
             th_val = thresholds.get(key, "")
             if not th_val:
@@ -737,28 +1389,35 @@ class ScoreChaserApp:
             if user_score < th_score:
                 gap = th_score - user_score
                 progress = user_score / th_score if th_score > 0 else 0
-                return label, f"+{_compact_score(str(gap))}", progress
+                return (label, f"+{_format_score(str(gap))}",
+                        _format_score(str(th_score)), progress)
         # User is #1 or above all thresholds
-        return "", "", 1.0
+        return "", "", "", 1.0
 
     def _refresh_list(self):
-        # Clear existing cards
-        for widget in self._game_list.winfo_children():
-            widget.destroy()
-        self._game_cards.clear()
+        """Debounced refresh — coalesces rapid calls into one rebuild."""
+        if self._refresh_pending is not None:
+            self.root.after_cancel(self._refresh_pending)
+        self._refresh_pending = self.root.after(50, self._do_refresh_list)
+
+    def _do_refresh_list(self):
+        self._refresh_pending = None
+
+        if self._current_view == "tournaments":
+            self._populate_tournament_list()
+            return
 
         hw_filter = self._get_hw_filter()
         personal_map = self._get_personal_map()
         search = get_token_username(self._token).lower() if self._token else ""
 
-        items = []  # (game_id, game, user_entry_or_None, thresholds)
+        items = []
 
         for gid, game in self.data.items():
             if gid in self._hidden_games:
                 continue
             th = _get_thresholds(game["scores"], hw_filter)
 
-            # Find user entry
             entry = None
             in_top100 = False
             if search:
@@ -773,33 +1432,36 @@ class ScoreChaserApp:
             if self._current_view == "my" and entry is None:
                 continue
 
-            items.append((gid, game, entry, in_top100, th))
+            overall_r, device_r, device_nm = self._resolve_user_ranks(
+                game.get("scores", []), entry, in_top100, search)
 
-        # Also add personal-only games not in scraped data
+            items.append((gid, game, entry, in_top100, th,
+                          overall_r, device_r, device_nm))
+
         if self._current_view == "my":
             existing_gids = {i[0] for i in items}
             for gid, ps_entry in personal_map.items():
                 if gid not in existing_gids and gid not in self._hidden_games:
-                    items.append((gid, {"name": ps_entry.get("userName", "Unknown"),
-                                        "scores": []}, ps_entry, False,
-                                  _get_thresholds([])))
+                    stub = {"name": ps_entry.get("userName", "Unknown"),
+                            "scores": []}
+                    overall_r, device_r, device_nm = self._resolve_user_ranks(
+                        [], ps_entry, False, search)
+                    items.append((gid, stub, ps_entry, False,
+                                   _get_thresholds([]),
+                                   overall_r, device_r, device_nm))
 
         # Sort
         sort_key = self._sort_var.get()
-        if sort_key == "Potential":
-            def potential_sort(item):
-                gid, game, entry, in_top100, th = item
-                if not entry:
-                    return (1, 0)
-                try:
-                    score = int(float(entry.get("score", "0")))
-                except (ValueError, TypeError):
-                    score = 0
-                _, _, progress = self._compute_target(score, th)
-                return (0, -progress)  # higher progress = closer to goal = sort first
-            items.sort(key=potential_sort)
-        elif sort_key == "Rank":
-            items.sort(key=lambda x: x[2].get("rank", 9999) if x[2] else 9999)
+        if sort_key == "Rank":
+            def rank_sort(item):
+                overall = item[5]
+                device = item[6]
+                if overall is not None:
+                    return (0, overall, device if device is not None else 9999)
+                if device is not None:
+                    return (1, device)
+                return (2, 0)
+            items.sort(key=rank_sort)
         elif sort_key == "Name":
             items.sort(key=lambda x: x[1]["name"].lower())
         elif sort_key == "Score":
@@ -812,57 +1474,42 @@ class ScoreChaserApp:
                     return 0
             items.sort(key=score_sort)
 
-        # Color rotation for game cards — cycling through vivid neon accents
+        # Build lightweight item dicts for the canvas
         accent_colors = [NEON_PINK, NEON_CYAN, NEON_GREEN, NEON_ORANGE,
                           AMBER_BRIGHT, NEON_YELLOW]
-
-        # Build cards
-        for idx, (gid, game, entry, in_top100, th) in enumerate(items):
+        canvas_items = []
+        for idx, (gid, game, entry, in_top100, th,
+                  overall_r, device_r, device_nm) in enumerate(items):
             if entry:
                 try:
                     user_score = int(float(entry.get("score", "0")))
                 except (ValueError, TypeError):
                     user_score = 0
-                rank = entry.get("rank", "")
-                if not hw_filter and not in_top100:
-                    rank_str = "> 100"
-                else:
-                    rank_str = str(rank)
-                score_str = _compact_score(entry.get("score", "0"))
-                target_label, gap_str, progress = self._compute_target(user_score, th)
+                rank_str = _format_rank_display(overall_r, device_r, device_nm)
+                score_str = _format_score(entry.get("score", "0"))
+                target_label, gap_str, target_score, progress = self._compute_target(user_score, th)
             else:
                 rank_str = "—"
                 score_str = ""
                 target_label = ""
                 gap_str = ""
+                target_score = ""
                 progress = 0
 
-            boxart_url = game.get("boxart", "") if isinstance(game, dict) else ""
-            thumb = self._get_thumbnail(boxart_url)
+            canvas_items.append({
+                "gid": gid,
+                "name": game.get("name", "Unknown"),
+                "rank_str": rank_str,
+                "score_str": score_str,
+                "target": target_label,
+                "gap_str": gap_str,
+                "target_score": target_score,
+                "accent": accent_colors[idx % len(accent_colors)],
+                "boxart_url": game.get("boxart", "") if isinstance(game, dict) else "",
+            })
 
-            accent = accent_colors[idx % len(accent_colors)]
-
-            card = GameCard(
-                self._game_list,
-                game_name=game["name"] if "name" in game else "Unknown",
-                rank_str=rank_str,
-                score_str=score_str,
-                next_target=target_label,
-                gap_str=gap_str,
-                progress=progress,
-                boxart_image=thumb,
-                accent_color=accent,
-                on_click=lambda g=gid: self._select_game(g),
-                on_right_click=lambda e, g=gid: self._show_card_menu(e, g),
-            )
-            card.pack(fill="x", padx=6, pady=3)
-            card.bind("<Enter>", card.on_enter)
-            card.bind("<Leave>", card.on_leave)
-            self._game_cards[gid] = card
-
-            # Async-load boxart if not cached
-            if boxart_url and thumb is None:
-                self._load_thumbnail(boxart_url, card)
+        self._game_list.set_items(canvas_items)
+        self._game_list.set_selected(self._selected_game_id)
 
         count = len(items)
         total = len(self.data) - len(self._hidden_games)
@@ -873,21 +1520,298 @@ class ScoreChaserApp:
 
         self._update_hidden_btn()
 
-        # Re-select if still valid
-        if self._selected_game_id and self._selected_game_id in self._game_cards:
-            self._game_cards[self._selected_game_id].set_selected(True)
+    # ── Tournament View ─────────────────────────────────────────
+
+    def _populate_tournament_list(self):
+        """Build canvas items for the tournaments view."""
+        search = get_token_username(self._token).lower() if self._token else ""
+        canvas_items = []
+
+        if not self._tournaments:
+            self._game_list.set_items([])
+            self._count_label.configure(
+                text="Loading tournaments…" if not self._tournaments_loaded
+                else "No tournaments found")
+            self._update_hidden_btn()
+            return
+
+        active_count = 0
+        for t in self._tournaments:
+            status = t.get("status", "")
+            if status == "Active":
+                active_count += 1
+                status_color = NEON_GREEN
+            elif status == "Expired":
+                status_color = NEON_PINK
+            else:
+                status_color = NEON_YELLOW
+
+            start = (t.get("start", "") or "")[:10]
+            end = (t.get("end", "") or "")[:10]
+            dates = f"{start} → {end}" if start else ""
+
+            tid = t.get("id")
+            cached = self._tournament_scores_cache.get(tid, [])
+            game_count = len(cached)
+            subtitle = f"{game_count} games" if game_count else ""
+
+            # Boxart of the first game, if available
+            boxart_url = ""
+            if cached:
+                boxart_url = cached[0].get("boxart", "") or ""
+
+            # User's best rank across the tournament's games
+            user_rank_str = ""
+            if search and cached:
+                best_rank = None
+                best_game = None
+                best_entry = None
+                for g in cached:
+                    for s in g.get("scores", []):
+                        if search == s.get("userName", "").lower():
+                            r = s.get("rank")
+                            if r is not None and (best_rank is None or r < best_rank):
+                                best_rank = r
+                                best_game = g
+                                best_entry = s
+                if best_rank and best_entry:
+                    overall_r, device_r, device_nm = self._resolve_user_ranks(
+                        best_game.get("scores", []), best_entry, True, search)
+                    user_rank_str = f"Your best: {_format_rank_display(overall_r, device_r, device_nm)}"
+
+            canvas_items.append({
+                "kind": "tournament",
+                "gid": str(tid),
+                "name": t.get("name", "Unknown"),
+                "status": status.upper(),
+                "status_color": status_color,
+                "dates": dates,
+                "subtitle": subtitle,
+                "user_rank_str": user_rank_str,
+                "accent": NEON_CYAN if status == "Active" else FG_DIM,
+                "boxart_url": boxart_url,
+                # Unused but required by canvas code paths
+                "rank_str": "", "score_str": "",
+                "target": "", "gap_str": "", "target_score": "",
+            })
+
+        self._game_list.set_items(canvas_items)
+        self._game_list.set_selected(
+            str(self._selected_tournament_id) if self._selected_tournament_id else None)
+
+        total = len(self._tournaments)
+        self._count_label.configure(
+            text=f"{total} tournaments  ·  {active_count} active")
+        self._update_hidden_btn()
+
+    def _show_tournament_detail(self, tournament_id: int):
+        """Render tournament games + top scores in the right detail panel."""
+        tournament = next(
+            (t for t in self._tournaments if t.get("id") == tournament_id), None)
+        if not tournament:
+            return
+
+        for w in self._detail_panel.winfo_children():
+            w.destroy()
+
+        # Header
+        header = ctk.CTkFrame(self._detail_panel, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(
+            header, text=tournament.get("name", "").upper(),
+            font=(TITLE_FONT_FAMILY, 16), text_color=AMBER,
+            anchor="w", wraplength=500,
+        ).pack(fill="x")
+
+        status = tournament.get("status", "")
+        start = (tournament.get("start", "") or "")[:10]
+        end = (tournament.get("end", "") or "")[:10]
+        meta = f"{status}   ·   {start} → {end}" if start else status
+        status_color = NEON_GREEN if status == "Active" else NEON_PINK
+        ctk.CTkLabel(
+            header, text=meta, font=(FONT_FAMILY, 13),
+            text_color=status_color, anchor="w",
+        ).pack(fill="x", pady=(2, 0))
+
+        ctk.CTkFrame(self._detail_panel, fg_color=NEON_PINK, height=2).pack(
+            fill="x", padx=8, pady=6)
+
+        games = self._tournament_scores_cache.get(tournament_id)
+
+        if games is None:
+            loading = ctk.CTkLabel(
+                self._detail_panel, text="Loading scores…",
+                font=(FONT_FAMILY, 13), text_color=FG_DIM,
+            )
+            loading.pack(pady=20)
+
+            def do_fetch():
+                try:
+                    scores = fetch_tournament_scores(tournament_id)
+                    self._tournament_scores_cache[tournament_id] = scores
+                    self.root.after(0,
+                        lambda: self._show_tournament_detail(tournament_id))
+                    self.root.after(0, self._refresh_list)
+                except Exception:
+                    self.root.after(0, lambda: loading.configure(text="Load failed"))
+
+            self._thumb_pool.submit(do_fetch)
+            return
+
+        if not games:
+            ctk.CTkLabel(
+                self._detail_panel, text="No scores available.",
+                font=(FONT_FAMILY, 13), text_color=FG_DIM,
+            ).pack(pady=20)
+            return
+
+        search = get_token_username(self._token).lower() if self._token else ""
+
+        for gi, g in enumerate(games):
+            game_name = g.get("name", "Unknown")
+            boxart_url = g.get("boxart", "") or ""
+            scores = g.get("scores", [])
+
+            # Build per-game thresholds (tournament has top 50 only)
+            sorted_scores = sorted(
+                scores,
+                key=lambda s: int(float(s.get("score", "0") or "0")),
+                reverse=True,
+            )
+            thresholds = {}
+            if len(sorted_scores) >= 1:
+                thresholds["high"] = sorted_scores[0].get("score", "")
+            if len(sorted_scores) >= 10:
+                thresholds["top10"] = sorted_scores[9].get("score", "")
+            if len(sorted_scores) >= 50:
+                thresholds["top50"] = sorted_scores[49].get("score", "")
+
+            # Find user entry
+            user_entry = None
+            if search:
+                for s in scores:
+                    if search == s.get("userName", "").lower():
+                        user_entry = s
+                        break
+
+            if gi > 0:
+                ctk.CTkFrame(
+                    self._detail_panel, fg_color=BG_HEADER, height=1,
+                ).pack(fill="x", padx=12, pady=(10, 6))
+
+            # Header: boxart + game name + user status
+            header = ctk.CTkFrame(self._detail_panel, fg_color="transparent")
+            header.pack(fill="x", padx=12, pady=(4, 4))
+
+            box = ctk.CTkLabel(header, text="", height=70, width=70,
+                                fg_color=BG_DARK, corner_radius=4)
+            box.pack(side="left", padx=(0, 10))
+            if boxart_url:
+                self._load_boxart(boxart_url, box, height=70)
+
+            info = ctk.CTkFrame(header, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True)
+
+            ctk.CTkLabel(
+                info, text=game_name.upper(),
+                font=(FONT_FAMILY, 14, "bold"),
+                text_color=GOLD, anchor="w", wraplength=420,
+            ).pack(fill="x")
+
+            if user_entry:
+                try:
+                    user_score_int = int(float(user_entry.get("score", "0")))
+                except (ValueError, TypeError):
+                    user_score_int = 0
+
+                overall_r, device_r, device_nm = self._resolve_user_ranks(
+                    scores, user_entry, True, search)
+                rank_display = _format_rank_display(overall_r, device_r, device_nm)
+
+                ctk.CTkLabel(
+                    info,
+                    text=f"Your Score: {_format_score(user_entry.get('score', '0'))}  "
+                         f"|  Rank: {rank_display}",
+                    font=(FONT_FAMILY, 13), text_color=NEON_YELLOW, anchor="w",
+                ).pack(fill="x", pady=(2, 0))
+
+                target_label, gap_str, target_score, _ = self._compute_target(
+                    user_score_int, thresholds, tiers=self._TOURNAMENT_TIERS)
+                if target_label:
+                    target_text = f"Next Target: {target_label}"
+                    if target_score:
+                        target_text += f"  [{target_score}]"
+                    if gap_str:
+                        target_text += f"   ({gap_str})"
+                    ctk.CTkLabel(
+                        info, text=target_text, font=(FONT_FAMILY, 12),
+                        text_color=AMBER_BRIGHT, anchor="w",
+                    ).pack(fill="x", pady=(2, 0))
+                else:
+                    ctk.CTkLabel(
+                        info, text="✓ You're #1 here!", font=(FONT_FAMILY, 12, "bold"),
+                        text_color=NEON_GREEN, anchor="w",
+                    ).pack(fill="x", pady=(2, 0))
+            elif search:
+                # Not ranked yet — show target based on thresholds
+                target_label, _, target_score, _ = self._compute_target(
+                    0, thresholds, tiers=self._TOURNAMENT_TIERS)
+                if target_label:
+                    txt = f"Not ranked · Target: {target_label}"
+                    if target_score:
+                        txt += f"  [{target_score}]"
+                    ctk.CTkLabel(
+                        info, text=txt, font=(FONT_FAMILY, 12),
+                        text_color=FG_DIM, anchor="w",
+                    ).pack(fill="x", pady=(2, 0))
+
+            # Top 10 scores
+            if not scores:
+                ctk.CTkLabel(
+                    self._detail_panel, text="No scores",
+                    font=(FONT_FAMILY, 12), text_color=FG_DIM, anchor="w",
+                ).pack(fill="x", padx=24, pady=(0, 4))
+                continue
+
+            for s in sorted_scores[:10]:
+                rank = s.get("rank", "?")
+                name = s.get("userName", "")
+                score = s.get("score", "0")
+                is_user = search and search == name.lower()
+                fg = NEON_YELLOW if is_user else (
+                    GOLD if rank == 1 else (
+                        NEON_GREEN if isinstance(rank, int) and rank <= 10 else FG_DEFAULT))
+
+                row = ctk.CTkFrame(self._detail_panel, fg_color="transparent")
+                row.pack(fill="x", padx=16)
+                ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 12),
+                             text_color=fg, width=40, anchor="e").pack(side="left")
+                ctk.CTkLabel(row, text=name, font=(FONT_FAMILY, 12),
+                             text_color=fg, width=140, anchor="w").pack(
+                    side="left", padx=(8, 0))
+                ctk.CTkLabel(row, text=_format_score(score),
+                             font=(FONT_FAMILY, 12), text_color=fg,
+                             anchor="e").pack(side="left", padx=(4, 0))
+                ctk.CTkLabel(row, text=_hw_name(s.get("hardware", "")),
+                             font=(FONT_FAMILY, 13), text_color=FG_DIM,
+                             width=80, anchor="e").pack(side="right")
 
     # ── Game Selection & Detail ─────────────────────────────────
 
     def _select_game(self, game_id: str):
-        # Deselect old
-        if self._selected_game_id and self._selected_game_id in self._game_cards:
-            self._game_cards[self._selected_game_id].set_selected(False)
+        # In tournaments view, game_id holds a tournament id (as string)
+        if self._current_view == "tournaments":
+            try:
+                tid = int(game_id)
+            except (ValueError, TypeError):
+                return
+            self._selected_tournament_id = tid
+            self._game_list.set_selected(game_id)
+            self._show_tournament_detail(tid)
+            return
 
         self._selected_game_id = game_id
-        if game_id in self._game_cards:
-            self._game_cards[game_id].set_selected(True)
-
+        self._game_list.set_selected(game_id)
         self._show_detail(game_id)
 
     def _show_detail(self, game_id: str):
@@ -909,14 +1833,14 @@ class ScoreChaserApp:
 
         self._boxart_label = ctk.CTkLabel(header, text="", height=100)
         self._boxart_label.pack(side="left", padx=(0, 12))
-        self._load_boxart(game.get("boxart", ""))
+        self._load_boxart(game.get("boxart", ""), self._boxart_label, height=100)
 
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.pack(side="left", fill="x", expand=True)
 
         ctk.CTkLabel(
             title_frame, text=game["name"].upper(),
-            font=(TITLE_FONT_FAMILY, 13), text_color=AMBER,
+            font=(TITLE_FONT_FAMILY, 15), text_color=AMBER,
             anchor="w", wraplength=400,
         ).pack(fill="x")
 
@@ -936,11 +1860,9 @@ class ScoreChaserApp:
                 user_entry = personal_map[game_id]
 
         if user_entry:
-            rank = user_entry.get("rank", "")
-            if not hw_filter and not in_top100:
-                rank_display = "> 100"
-            else:
-                rank_display = f"#{rank}"
+            overall_r, device_r, device_nm = self._resolve_user_ranks(
+                game.get("scores", []), user_entry, in_top100, search)
+            rank_display = _format_rank_display(overall_r, device_r, device_nm)
 
             ctk.CTkLabel(
                 title_frame,
@@ -962,7 +1884,7 @@ class ScoreChaserApp:
 
             ctk.CTkLabel(
                 self._detail_panel, text="▸ NEXT TARGETS",
-                font=(FONT_FAMILY, 12, "bold"), text_color=NEON_CYAN, anchor="w",
+                font=(FONT_FAMILY, 14, "bold"), text_color=NEON_CYAN, anchor="w",
             ).pack(fill="x", padx=12, pady=(0, 4))
 
             for label, key in [("Top 100", "top100"), ("Top 50", "top50"),
@@ -989,12 +1911,12 @@ class ScoreChaserApp:
                         AMBER if progress > 0.7 else FG_DEFAULT)
                     gap_text = f"+{_compact_score(str(gap))}"
 
-                ctk.CTkLabel(row, text=label, font=(FONT_FAMILY, 11),
+                ctk.CTkLabel(row, text=label, font=(FONT_FAMILY, 13),
                              text_color=FG_DIM, width=65, anchor="w").pack(side="left")
                 ctk.CTkLabel(row, text=_format_score(str(th_score)),
-                             font=(FONT_FAMILY, 11), text_color=status_color,
+                             font=(FONT_FAMILY, 13), text_color=status_color,
                              width=120, anchor="e").pack(side="left")
-                ctk.CTkLabel(row, text=gap_text, font=(FONT_FAMILY, 11),
+                ctk.CTkLabel(row, text=gap_text, font=(FONT_FAMILY, 13),
                              text_color=status_color, width=80,
                              anchor="e").pack(side="left", padx=(8, 0))
 
@@ -1020,10 +1942,10 @@ class ScoreChaserApp:
                                           ("monthly", "▸ THIS MONTH", NEON_ORANGE)]:
                 section = ctk.CTkFrame(time_frame, fg_color="transparent")
                 section.pack(fill="x", pady=(0, 4))
-                ctk.CTkLabel(section, text=label, font=(FONT_FAMILY, 12, "bold"),
+                ctk.CTkLabel(section, text=label, font=(FONT_FAMILY, 14, "bold"),
                              text_color=color, anchor="w").pack(fill="x")
                 loading = ctk.CTkLabel(section, text="Loading...",
-                                        font=(FONT_FAMILY, 10), text_color=FG_DIM,
+                                        font=(FONT_FAMILY, 12), text_color=FG_DIM,
                                         anchor="w")
                 loading.pack(fill="x")
                 self._load_time_scores(internal, period, section, loading)
@@ -1035,7 +1957,7 @@ class ScoreChaserApp:
         # Leaderboard
         ctk.CTkLabel(
             self._detail_panel, text="▸ LEADERBOARD",
-            font=(FONT_FAMILY, 12, "bold"), text_color=GOLD, anchor="w",
+            font=(FONT_FAMILY, 14, "bold"), text_color=GOLD, anchor="w",
         ).pack(fill="x", padx=12, pady=(0, 4))
 
         scores = game["scores"]
@@ -1059,15 +1981,15 @@ class ScoreChaserApp:
                 GOLD if rank == 1 else (
                     NEON_GREEN if rank <= 10 else FG_DEFAULT))
 
-            ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 10),
+            ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 12),
                          text_color=fg, width=40, anchor="e").pack(side="left")
-            ctk.CTkLabel(row, text=s.get("userName", ""), font=(FONT_FAMILY, 10),
+            ctk.CTkLabel(row, text=s.get("userName", ""), font=(FONT_FAMILY, 12),
                          text_color=fg, width=130, anchor="w").pack(side="left", padx=(8, 0))
             ctk.CTkLabel(row, text=_format_score(s.get("score", "0")),
-                         font=(FONT_FAMILY, 10), text_color=fg,
+                         font=(FONT_FAMILY, 12), text_color=fg,
                          anchor="e").pack(side="left", padx=(4, 0))
             ctk.CTkLabel(row, text=_hw_name(s.get("hardware", "")),
-                         font=(FONT_FAMILY, 9), text_color=FG_DIM,
+                         font=(FONT_FAMILY, 13), text_color=FG_DIM,
                          width=80, anchor="e").pack(side="right")
 
             # Right-click binding
@@ -1077,19 +1999,21 @@ class ScoreChaserApp:
         # Append user if not shown
         if search and not user_shown and user_entry:
             ctk.CTkLabel(self._detail_panel, text="···",
-                         font=(FONT_FAMILY, 10), text_color=FG_DIM).pack(pady=2)
+                         font=(FONT_FAMILY, 12), text_color=FG_DIM).pack(pady=2)
             row = ctk.CTkFrame(self._detail_panel, fg_color=HIGHLIGHT_BG,
                                corner_radius=4)
             row.pack(fill="x", padx=12, pady=2)
 
-            rank_display = "> 100" if not hw_filter and not in_top100 else f"#{user_entry.get('rank', '')}"
-            ctk.CTkLabel(row, text=rank_display, font=(FONT_FAMILY, 10, "bold"),
-                         text_color=NEON_YELLOW, width=50, anchor="e").pack(side="left", padx=(4, 0))
+            overall_r2, device_r2, device_nm2 = self._resolve_user_ranks(
+                game.get("scores", []), user_entry, in_top100, search)
+            rank_display = _format_rank_display(overall_r2, device_r2, device_nm2)
+            ctk.CTkLabel(row, text=rank_display, font=(FONT_FAMILY, 12, "bold"),
+                         text_color=NEON_YELLOW, anchor="w").pack(side="left", padx=(4, 0))
             ctk.CTkLabel(row, text=user_entry.get("userName", ""),
-                         font=(FONT_FAMILY, 10, "bold"), text_color=NEON_YELLOW,
+                         font=(FONT_FAMILY, 12, "bold"), text_color=NEON_YELLOW,
                          width=130, anchor="w").pack(side="left", padx=(8, 0))
             ctk.CTkLabel(row, text=_format_score(user_entry.get("score", "0")),
-                         font=(FONT_FAMILY, 10, "bold"), text_color=NEON_YELLOW,
+                         font=(FONT_FAMILY, 12, "bold"), text_color=NEON_YELLOW,
                          anchor="e").pack(side="left", padx=(4, 0))
 
     def _load_time_scores(self, internal_number, period, parent, loading_label):
@@ -1101,31 +2025,31 @@ class ScoreChaserApp:
             except Exception:
                 self.root.after(0, lambda: loading_label.configure(text="—"))
 
-        threading.Thread(target=do_fetch, daemon=True).start()
+        self._thumb_pool.submit(do_fetch)
 
     def _display_time_scores(self, scores, parent, loading_label):
         loading_label.destroy()
         if not scores:
-            ctk.CTkLabel(parent, text="No scores", font=(FONT_FAMILY, 10),
+            ctk.CTkLabel(parent, text="No scores", font=(FONT_FAMILY, 12),
                          text_color=FG_DIM, anchor="w").pack(fill="x")
             return
         for s in scores[:3]:
             text = f"#{s.get('rank', '?')}  {s.get('userName', '')}  {_format_score(s.get('score', '0'))}"
-            ctk.CTkLabel(parent, text=text, font=(FONT_FAMILY, 10),
+            ctk.CTkLabel(parent, text=text, font=(FONT_FAMILY, 12),
                          text_color=FG_DEFAULT, anchor="w").pack(fill="x")
 
-    # ── Thumbnail (for game cards) ──────────────────────────────
+    # ── Boxart (detail view) ──────────────────────────────────────
 
-    def _get_thumbnail(self, url: str):
-        """Return cached thumbnail CTkImage or None if not loaded yet."""
-        if not url:
-            return None
-        return self._thumb_cache.get(url)
-
-    def _load_thumbnail(self, url: str, card: GameCard):
-        """Load thumbnail async and update the card."""
-        if url in self._thumb_cache:
-            card.set_boxart(self._thumb_cache[url])
+    def _load_boxart(self, url: str, target_label, height: int = 100):
+        """Async-load boxart and place in the given label."""
+        if not url or target_label is None:
+            return
+        key = (url, height)
+        if key in self._image_cache:
+            try:
+                target_label.configure(image=self._image_cache[key])
+            except Exception:
+                pass
             return
 
         def fetch():
@@ -1133,62 +2057,31 @@ class ScoreChaserApp:
                 resp = self._http.get(url, timeout=8)
                 resp.raise_for_status()
                 pil = Image.open(io.BytesIO(resp.content))
-                # Scale to fixed height, preserve aspect ratio
-                h = GameCard.BOXART_HEIGHT
+                h = height
                 w = int(pil.width * h / pil.height) if pil.height else h
                 pil = pil.resize((w, h), Image.LANCZOS)
-                self.root.after(0, lambda: self._set_thumbnail(url, pil, card, w, h))
+                self.root.after(0, lambda: self._set_boxart(key, pil, w, h, target_label))
             except Exception:
                 pass
 
-        threading.Thread(target=fetch, daemon=True).start()
+        self._thumb_pool.submit(fetch)
 
-    def _set_thumbnail(self, url: str, pil_img, card, w, h):
+    def _set_boxart(self, key, pil_img, w, h, target_label):
         try:
             ctk_img = ctk.CTkImage(pil_img, size=(w, h))
-            self._thumb_cache[url] = ctk_img
+            self._image_cache[key] = ctk_img
             try:
-                card.set_boxart(ctk_img)
+                target_label.configure(image=ctk_img)
             except Exception:
                 pass
-        except Exception:
-            pass
-
-    # ── Boxart ──────────────────────────────────────────────────
-
-    def _load_boxart(self, url: str):
-        if not url:
-            return
-        if url in self._image_cache:
-            self._boxart_label.configure(image=self._image_cache[url])
-            return
-
-        def fetch():
-            try:
-                resp = self._http.get(url, timeout=8)
-                resp.raise_for_status()
-                pil = Image.open(io.BytesIO(resp.content))
-                # Preserve aspect ratio, fixed height
-                h = 100
-                w = int(pil.width * h / pil.height) if pil.height else h
-                pil = pil.resize((w, h), Image.LANCZOS)
-                self.root.after(0, lambda: self._set_boxart(url, pil, w, h))
-            except Exception:
-                pass
-
-        threading.Thread(target=fetch, daemon=True).start()
-
-    def _set_boxart(self, url, pil_img, w=100, h=100):
-        try:
-            ctk_img = ctk.CTkImage(pil_img, size=(w, h))
-            self._image_cache[url] = ctk_img
-            self._boxart_label.configure(image=ctk_img)
         except Exception:
             pass
 
     # ── Context Menus ───────────────────────────────────────────
 
     def _show_card_menu(self, event, game_id):
+        if self._current_view == "tournaments":
+            return  # no context actions for tournaments
         self._ctx_game_id = game_id
         self._ctx_menu.post(event.x_root, event.y_root)
 
@@ -1213,7 +2106,7 @@ class ScoreChaserApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="HIDDEN GAMES", font=(FONT_FAMILY, 12, "bold"),
+        ctk.CTkLabel(dlg, text="HIDDEN GAMES", font=(FONT_FAMILY, 14, "bold"),
                      text_color=AMBER).pack(pady=(12, 8))
 
         scroll = ctk.CTkScrollableFrame(dlg, fg_color=BG_PANEL)
@@ -1227,12 +2120,12 @@ class ScoreChaserApp:
 
             row = ctk.CTkFrame(scroll, fg_color=BG_CARD, corner_radius=4)
             row.pack(fill="x", pady=2)
-            ctk.CTkLabel(row, text=name, font=(FONT_FAMILY, 10),
+            ctk.CTkLabel(row, text=name, font=(FONT_FAMILY, 12),
                          text_color=FG_DEFAULT, anchor="w").pack(
                 side="left", padx=8, pady=4)
             ctk.CTkButton(
                 row, text="Unhide", width=60, height=24,
-                font=(FONT_FAMILY, 9), fg_color=BG_HEADER,
+                font=(FONT_FAMILY, 13), fg_color=BG_HEADER,
                 hover_color=AMBER_DIM, text_color=FG_DEFAULT,
                 command=lambda g=gid, r=row: (
                     self._hidden_games.discard(g),
@@ -1245,7 +2138,7 @@ class ScoreChaserApp:
         btn_frame.pack(fill="x", padx=12, pady=12)
 
         ctk.CTkButton(btn_frame, text="UNHIDE ALL", width=100,
-                       font=(FONT_FAMILY, 10, "bold"),
+                       font=(FONT_FAMILY, 12, "bold"),
                        fg_color=BG_CARD, hover_color=AMBER_DIM,
                        text_color=NEON_ORANGE,
                        command=lambda: (self._hidden_games.clear(),
@@ -1253,7 +2146,7 @@ class ScoreChaserApp:
                                         dlg.destroy(),
                                         self._refresh_list())).pack(side="left")
         ctk.CTkButton(btn_frame, text="CLOSE", width=80,
-                       font=(FONT_FAMILY, 10),
+                       font=(FONT_FAMILY, 12),
                        fg_color=BG_CARD, hover_color=BG_CARD_HOVER,
                        text_color=FG_DIM,
                        command=lambda: (dlg.destroy(),
@@ -1262,6 +2155,25 @@ class ScoreChaserApp:
     # ── Cleanup ─────────────────────────────────────────────────
 
     def _on_close(self):
+        # Persist current data and snapshot so next start is ready
+        if self.data:
+            try:
+                save_data(self.data)
+            except Exception:
+                pass
+        try:
+            snapshot = self._compute_snapshot()
+            if snapshot:
+                save_snapshot(snapshot)
+        except Exception:
+            pass
+        if self._tournaments or self._tournament_scores_cache:
+            try:
+                save_tournaments_cache(self._tournaments,
+                                        self._tournament_scores_cache)
+            except Exception:
+                pass
+        self._thumb_pool.shutdown(wait=False)
         self.root.destroy()
 
 

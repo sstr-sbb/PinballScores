@@ -32,6 +32,9 @@ else:
 DATA_DIR = _APP_DIR / "data"
 SCORES_FILE = DATA_DIR / "scores.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+SNAPSHOT_FILE = DATA_DIR / "user_snapshot.json"
+PERSONAL_SCORES_FILE = DATA_DIR / "personal_scores.json"
+TOURNAMENTS_FILE = DATA_DIR / "tournaments.json"
 
 MAX_WORKERS_GAMES = 5
 MAX_WORKERS_SCORES = 10
@@ -360,6 +363,74 @@ def save_settings(settings: dict) -> None:
     DATA_DIR.mkdir(exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def load_snapshot() -> dict:
+    """Load the user state snapshot from the last session."""
+    if not SNAPSHOT_FILE.exists():
+        return {}
+    try:
+        with open(SNAPSHOT_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def save_snapshot(snapshot: dict) -> None:
+    """Save the current user state snapshot for next-session comparison."""
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+
+
+def load_personal_scores() -> list[dict]:
+    """Load previously fetched personal scores from disk."""
+    if not PERSONAL_SCORES_FILE.exists():
+        return []
+    try:
+        with open(PERSONAL_SCORES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def save_personal_scores(scores: list[dict]) -> None:
+    """Save personal scores so they're available at next startup."""
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(PERSONAL_SCORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=2)
+
+
+def load_tournaments_cache() -> dict:
+    """Load cached tournaments + score data.
+    Returns {"tournaments": [...], "scores": {tid: [game_scores...]}}."""
+    empty = {"tournaments": [], "scores": {}}
+    if not TOURNAMENTS_FILE.exists():
+        return empty
+    try:
+        with open(TOURNAMENTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return empty
+        return {
+            "tournaments": data.get("tournaments", []) or [],
+            "scores": data.get("scores", {}) or {},
+        }
+    except (json.JSONDecodeError, ValueError):
+        return empty
+
+
+def save_tournaments_cache(tournaments: list[dict],
+                            scores_by_tid: dict) -> None:
+    """Persist tournaments and their scores for offline use."""
+    DATA_DIR.mkdir(exist_ok=True)
+    scores_str = {str(k): v for k, v in scores_by_tid.items()}
+    with open(TOURNAMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"tournaments": tournaments, "scores": scores_str},
+            f, ensure_ascii=False, indent=2,
+        )
 
 
 def login_via_browser() -> tuple[str | None, str | None]:

@@ -1,26 +1,21 @@
 # ScoreChaser
 
-A desktop app for tracking your standings on [ATGames ArcadeNet](https://www.atgames.net/leaderboards/titles) pinball leaderboards. Fetches the top 100 scores for all games, shows your personal rankings — even beyond the top 100 — and lets you chase higher scores.
+A desktop app for tracking your standings on [ATGames ArcadeNet](https://www.atgames.net/leaderboards/titles) pinball leaderboards. Fetches the top 100 scores for every game, shows your personal rankings (even beyond top 100), surfaces the targets you can realistically chase, and tells you — with a motivating quote — what has changed since your last session.
 
 ## Features
 
-- **ArcadeNet Login** — log in with your ArcadeNet account via browser to see your personal data
-- **Personal rankings beyond top 100** — see your rank and score for all games you've played, not just the ones where you made the public leaderboard
-- **All Games overview** with score thresholds for Highscore, Top 10, Top 50, and Top 100
-- **Column sorting** — click any column header to sort ascending/descending
-- **Hide games** — right-click to hide games you don't care about; unhide them anytime via the status bar
-- **Tournament view** with drill-down into individual tournament games
-- **Detail view** with full top 100 list, boxart, and color-coded ranks
-- **Right-click** any player in the detail view to look up their scores
-- **Parallel scraper** fetches all game titles and top 100 scores in under 20 seconds
-- **Auto-refresh** on startup; data is cached locally for instant access
-- **Retro LCD theme** — amber segment-display title, vivid neon accents, Share Tech Mono font
-
-## Screenshots
-
-![All Games overview with score thresholds](screenshots/allScores.png)
-
-![User rankings with per-game scores and targets](screenshots/UserScore.png)
+- **ArcadeNet login** via browser for full access to your personal data
+- **Personal rankings beyond top 100** — scores and ranks for every game you've played
+- **Overall + device ranks** — primary rank is across all devices; the bracketed one in parentheses is your rank on your own hardware, e.g. `#97 (#23 on Pinball 4K)`
+- **Next-Target guidance** — shows what it takes to enter the Top 100 / 50 / 10 or become #1, with exact point gap
+- **Tournaments view** with per-game leaderboards, boxart, and device-aware targets
+- **Score-update popup** — after each refresh, highlights where you improved (score + places), where you were overtaken, and where you entered or fell out of the leaderboard — always paired with a motivational quote
+- **Hardware filter** for device-specific threshold views
+- **Hide games** — right-click a card to hide, manage via the status bar
+- **Canvas-rendered game list** — hundreds of cards without UI lag
+- **Offline caching** — top-100 scores, personal scores, and tournament data are all persisted locally; next start is instant
+- **Parallel scraper** fetches all titles and top-100 scores concurrently
+- **Amber retro theme** with vivid neon accents, Share Tech Mono, and DSEG-inspired title
 
 ## Download
 
@@ -49,22 +44,30 @@ source .venv/bin/activate
 python app.py
 ```
 
-On first launch the app will automatically fetch all leaderboard data. Subsequent launches load cached data instantly and refresh in the background.
+On first launch the app fetches all leaderboard data. Subsequent launches load cached data instantly and refresh in the background.
 
 Click **LOGIN** to sign in with your ArcadeNet account. Your personal rankings across all games will be loaded automatically. The session token is stored locally and valid for 7 days.
+
+Use the **MY GAMES / ALL GAMES / TOURNAMENTS** toggle to switch views. Click any card to see a detailed breakdown in the right panel: next targets, this-week / this-month leaders, and the full top-100 leaderboard with your own score pinned if you're outside the visible range.
 
 ## How it works
 
 The scraper uses the ATGames ArcadeNet API:
 
-1. Game titles are fetched in parallel by prefix letter (A-Z)
-2. Top 100 scores for each game are fetched concurrently (pipelined with step 1)
-3. Personal rankings are fetched via authenticated API (paginated, all games)
-4. Data is stored as JSON in `data/scores.json`, settings in `data/settings.json`
+1. Game titles are fetched in parallel by prefix letter (A–Z)
+2. Top 100 scores per game are fetched concurrently (pipelined with step 1)
+3. Personal rankings are fetched via authenticated API (paginated across all games)
+4. Tournament metadata and per-tournament scores are fetched on demand
+5. Everything is persisted as JSON under `data/`:
+   - `scores.json` — top 100 per game
+   - `personal_scores.json` — user's full ranking list
+   - `tournaments.json` — tournament definitions and scores
+   - `user_snapshot.json` — last-session snapshot for change detection
+   - `settings.json` — hidden games, auth token
 
-Login is handled via Selenium — a Chrome browser window opens for you to sign in on the ATGames website. The JWT token is extracted from localStorage after login.
+Login is handled via Selenium — a Chrome browser window opens for you to sign in on the ATGames website. The JWT token is extracted from `localStorage` after login.
 
-The GUI is built with tkinter using a custom `ColorTable` widget that provides per-column foreground colors, click-to-sort headers, and synchronized scrolling through paired treeviews.
+The UI is built with CustomTkinter. The main game list uses a plain `tk.Canvas` with drawn items instead of widget cards, which keeps scrolling and hover interactions fluid even with hundreds of games.
 
 ## AI Disclosure
 
