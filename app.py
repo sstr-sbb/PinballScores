@@ -112,12 +112,6 @@ def _hw_name(code: str) -> str:
     return HARDWARE_NAMES.get(code, code)
 
 
-def _hw_codes_for_filter(name: str) -> set[str] | None:
-    if name == "All Devices":
-        return None
-    return _HW_GROUPS.get(name, set())
-
-
 def _format_score(score_str: str) -> str:
     try:
         return f"{int(float(score_str)):,}".replace(",", ".")
@@ -154,12 +148,8 @@ def _format_rank_display(overall: int | None, device: int | None,
     return "> 100"
 
 
-def _get_thresholds(scores: list[dict], hw_filter: set[str] | None = None) -> dict:
-    if hw_filter:
-        scores = [s for s in scores if s.get("hardware", "") in hw_filter]
-        by_rank = {i + 1: s["score"] for i, s in enumerate(scores)}
-    else:
-        by_rank = {s["rank"]: s["score"] for s in scores if s.get("rank")}
+def _get_thresholds(scores: list[dict]) -> dict:
+    by_rank = {s["rank"]: s["score"] for s in scores if s.get("rank")}
     return {
         "top100": by_rank.get(100, ""),
         "top50": by_rank.get(50, ""),
@@ -608,20 +598,6 @@ class ScoreChaserApp:
             anchor="w",
         ).pack(anchor="w", pady=(0, 0))
 
-        # Device filter
-        ctk.CTkLabel(top, text="DEVICE", font=(FONT_FAMILY, 13),
-                     text_color=FG_DIM).pack(side="left")
-        self._hw_var = tk.StringVar(value="All Devices")
-        self._hw_combo = ctk.CTkComboBox(
-            top, variable=self._hw_var, values=["All Devices"],
-            width=150, font=(FONT_FAMILY, 13), state="readonly",
-            fg_color=BG_CARD, border_color=BG_HEADER,
-            button_color=AMBER_DIM, button_hover_color=AMBER,
-            dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
-            command=lambda _: self._refresh_list(),
-        )
-        self._hw_combo.pack(side="left", padx=(4, 16))
-
         # Login area (right side)
         self._login_btn = ctk.CTkButton(
             top, text="LOGIN", width=80, font=(FONT_FAMILY, 13, "bold"),
@@ -762,7 +738,6 @@ class ScoreChaserApp:
         if data:
             self.data = data
             self._status_label.configure(text=f"{len(data)} games loaded. Refreshing...")
-            self._update_hw_options()
             self._refresh_list()
         else:
             self._status_label.configure(text="No data. Loading...")
@@ -981,7 +956,6 @@ class ScoreChaserApp:
         self._status_label.configure(text=f"{len(data)} games loaded.")
         self._progress_bar.pack_forget()
         self._refresh_btn.configure(state="normal")
-        self._update_hw_options()
         self._backfill_missing_games()
         self._refresh_list()
         self._maybe_compare_snapshot()
@@ -991,20 +965,6 @@ class ScoreChaserApp:
         self._refresh_btn.configure(state="normal")
         from tkinter import messagebox
         messagebox.showerror("Error", f"Scraping failed:\n{error}")
-
-    # ── Hardware Filter ─────────────────────────────────────────
-
-    def _update_hw_options(self):
-        hw_names = set()
-        for game in self.data.values():
-            for s in game.get("scores", []):
-                name = _hw_name(s.get("hardware", ""))
-                if name:
-                    hw_names.add(name)
-        self._hw_combo.configure(values=["All Devices"] + sorted(hw_names))
-
-    def _get_hw_filter(self) -> set[str] | None:
-        return _hw_codes_for_filter(self._hw_var.get())
 
     # ── View Toggle ─────────────────────────────────────────────
 
@@ -1407,7 +1367,6 @@ class ScoreChaserApp:
             self._populate_tournament_list()
             return
 
-        hw_filter = self._get_hw_filter()
         personal_map = self._get_personal_map()
         search = get_token_username(self._token).lower() if self._token else ""
 
@@ -1416,7 +1375,7 @@ class ScoreChaserApp:
         for gid, game in self.data.items():
             if gid in self._hidden_games:
                 continue
-            th = _get_thresholds(game["scores"], hw_filter)
+            th = _get_thresholds(game["scores"])
 
             entry = None
             in_top100 = False
@@ -1823,7 +1782,6 @@ class ScoreChaserApp:
         if not game:
             return
 
-        hw_filter = self._get_hw_filter()
         search = get_token_username(self._token).lower() if self._token else ""
         personal_map = self._get_personal_map()
 
@@ -1848,10 +1806,7 @@ class ScoreChaserApp:
         user_entry = None
         in_top100 = False
         if search:
-            scores = game["scores"]
-            if hw_filter:
-                scores = [s for s in scores if s.get("hardware", "") in hw_filter]
-            for s in scores:
+            for s in game["scores"]:
                 if search == s.get("userName", "").lower():
                     user_entry = s
                     in_top100 = True
@@ -1875,7 +1830,7 @@ class ScoreChaserApp:
             fill="x", padx=8, pady=6)
 
         # Next Targets section
-        th = _get_thresholds(game["scores"], hw_filter)
+        th = _get_thresholds(game["scores"])
         if user_entry:
             try:
                 user_score = int(float(user_entry.get("score", "0")))
@@ -1961,15 +1916,13 @@ class ScoreChaserApp:
         ).pack(fill="x", padx=12, pady=(0, 4))
 
         scores = game["scores"]
-        if hw_filter:
-            scores = [s for s in scores if s.get("hardware", "") in hw_filter]
 
         # Show top 20 + user if outside
         user_shown = False
         display_scores = scores[:20]
 
         for i, s in enumerate(display_scores):
-            rank = i + 1 if hw_filter else s.get("rank", i + 1)
+            rank = s.get("rank", i + 1)
             is_user = search and search == s.get("userName", "").lower()
             if is_user:
                 user_shown = True
