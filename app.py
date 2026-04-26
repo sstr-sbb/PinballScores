@@ -1,10 +1,12 @@
 """ScoreChaser - ATGames Leaderboard Viewer."""
 
+import ctypes
 import io
 import random
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,7 +32,7 @@ else:
     _ASSET_DIR = Path(__file__).parent
 _FONT_DIR = _ASSET_DIR / "fonts"
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # -- Color Scheme (Amber main + vivid colorful accents) --
 BG_DARK = "#080600"
@@ -64,6 +66,82 @@ elif sys.platform == "darwin":
 else:
     FONT_FAMILY = "Ubuntu Sans Mono"
     TITLE_FONT_FAMILY = "Ubuntu Sans Mono"
+
+
+# -- DPI / runtime UI scaling --
+# Set by _apply_dpi_scaling() once Tk is initialized. CustomTkinter scales
+# its own widgets via per-window DPI detection; the helpers below cover the
+# raw tk.Canvas/Text/Menu pieces CTk doesn't touch.
+UI_SCALE = 1.0    # multiplier for raw-tk pixel dimensions
+FONT_SCALE = 1.0  # multiplier for raw-tk font point sizes (often 1.0 — see below)
+
+
+def _enable_dpi_awareness():
+    """Tell Windows we'll handle DPI ourselves so it stops bitmap-scaling
+    the app on hi-DPI displays. Must run before any window is created."""
+    if sys.platform != "win32":
+        return
+    for setter in (
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),  # Per-Monitor v2
+        lambda: ctypes.windll.shcore.SetProcessDpiAwareness(1),  # System DPI
+        lambda: ctypes.windll.user32.SetProcessDPIAware(),
+    ):
+        try:
+            setter()
+            return
+        except (OSError, AttributeError):
+            continue
+
+
+def _apply_dpi_scaling(root):
+    """Detect screen DPI and set UI_SCALE / FONT_SCALE for raw-tk widgets.
+
+    We deliberately do NOT call ctk.set_widget_scaling(): CustomTkinter
+    auto-detects per-window DPI via GetDpiForMonitor() and scales its widgets
+    on its own.
+
+    For raw tk widgets (Canvas/Text/Menu) we have to handle scaling ourselves
+    — but only for *pixel* values. Modern Tk on a DPI-aware Windows process
+    auto-adjusts its internal pt-to-px factor ('tk scaling'), so positive-pt
+    font sizes already render at the right physical size; multiplying again
+    would double-scale. We compare Tk's reported DPI against the physical
+    monitor DPI to decide whether to also scale font sizes."""
+    global UI_SCALE, FONT_SCALE
+
+    try:
+        tk_dpi = float(root.winfo_fpixels("1i"))
+    except Exception:
+        tk_dpi = 96.0
+
+    physical_dpi = tk_dpi
+    if sys.platform == "win32":
+        try:
+            hwnd = root.winfo_id()
+            d = float(ctypes.windll.user32.GetDpiForWindow(hwnd))
+            if d > 0:
+                physical_dpi = d
+        except (OSError, AttributeError):
+            pass
+
+    UI_SCALE = max(physical_dpi / 96.0, 1.0)
+
+    # If Tk's pt-to-px conversion already reflects physical DPI, fonts will
+    # auto-scale via positive-pt sizes — don't multiply ourselves.
+    if tk_dpi >= physical_dpi * 0.95:
+        FONT_SCALE = 1.0
+    else:
+        FONT_SCALE = UI_SCALE
+
+
+def _sf(value: float) -> int:
+    """Scale a raw-tk pixel dimension by UI_SCALE."""
+    return max(int(round(value * UI_SCALE)), 1)
+
+
+def _sfont(size: int) -> int:
+    """Scale a font point size for raw-tk widgets (Canvas/Text/Menu) using
+    FONT_SCALE — usually 1.0 because Tk auto-handles points on hi-DPI."""
+    return max(int(round(size * FONT_SCALE)), 1)
 
 # -- Motivational quotes shown after refresh popup --
 MOTIVATING_QUOTES = [
@@ -212,7 +290,6 @@ def _detect_installed_fonts(root):
     Must be called AFTER the Tk root has been created."""
     global TITLE_FONT_FAMILY, FONT_FAMILY
     try:
-        import tkinter.font as tkfont
         families = {f.lower(): f for f in tkfont.families(root=root)}
         if "dseg14 classic" in families:
             TITLE_FONT_FAMILY = families["dseg14 classic"]
@@ -227,16 +304,24 @@ def _detect_installed_fonts(root):
 class CanvasGameList:
     """Renders the game list as lightweight canvas items instead of widgets."""
 
-    THUMB_MAX_W = 68
-    THUMB_MAX_H = 68
-    CARD_H = 86
-    CARD_PAD_Y = 4
-    CARD_PAD_X = 6
-    CARD_TOTAL = CARD_H + CARD_PAD_Y * 2
-    TEXT_X_NO_IMG = 12   # text x-offset when no image
-    TEXT_X_WITH_IMG = 86  # text x-offset when image present (8 + 68 + 10)
-
     def __init__(self, parent, on_select, on_right_click, http_session, thumb_pool):
+        # Pixel dimensions scale with UI_SCALE — raw tk.Canvas isn't
+        # scaled by CustomTkinter's set_widget_scaling.
+        self.THUMB_MAX_W = _sf(68)
+        self.THUMB_MAX_H = _sf(68)
+        self.CARD_H = _sf(86)
+        self.CARD_PAD_Y = _sf(4)
+        self.CARD_PAD_X = _sf(6)
+        self.CARD_TOTAL = self.CARD_H + self.CARD_PAD_Y * 2
+        self.TEXT_X_NO_IMG = _sf(12)   # text x-offset when no image
+        self.TEXT_X_WITH_IMG = _sf(86)  # text x-offset when image present (8 + 68 + 10)
+
+        # Reusable font handle for measuring titles when truncating with "…"
+        # so long names don't wrap onto row 2 / row 3.
+        self._title_font_obj = tkfont.Font(
+            family=FONT_FAMILY, size=_sfont(13), weight="bold")
+        self._truncate_cache: dict[tuple[str, int], str] = {}
+
         self._on_select = on_select
         self._on_right_click = on_right_click
         self._http = http_session
@@ -311,6 +396,27 @@ class CanvasGameList:
             return x0 + self.TEXT_X_WITH_IMG
         return x0 + self.TEXT_X_NO_IMG
 
+    def _truncate_title(self, text: str, max_width: int) -> str:
+        """Trim text with an ellipsis until it fits in max_width pixels at
+        the title font. Cached because _redraw runs on every resize/scroll."""
+        if not text:
+            return ""
+        key = (text, max_width)
+        cached = self._truncate_cache.get(key)
+        if cached is not None:
+            return cached
+        font = self._title_font_obj
+        if font.measure(text) <= max_width:
+            self._truncate_cache[key] = text
+            return text
+        ellipsis = "…"
+        n = len(text) - 1
+        while n > 0 and font.measure(text[:n].rstrip() + ellipsis) > max_width:
+            n -= 1
+        result = (text[:n].rstrip() + ellipsis) if n > 0 else ellipsis
+        self._truncate_cache[key] = result
+        return result
+
     def _redraw(self):
         w = self._canvas.winfo_width()
         if w < 10:
@@ -341,7 +447,7 @@ class CanvasGameList:
             url = item.get("boxart_url", "")
             if url and url in self._photo_cache:
                 img_id = self._canvas.create_image(
-                    x0 + 8, y + 8, anchor="nw",
+                    x0 + _sf(8), y + _sf(8), anchor="nw",
                     image=self._photo_cache[url],
                 )
                 self._img_canvas_ids[i] = img_id
@@ -349,11 +455,17 @@ class CanvasGameList:
             tx = self._text_x(item, x0)
             kind = item.get("kind", "game")
 
-            # Title (row 1)
+            row1_y = y + _sf(10)
+            row2_y = y + _sf(36)
+            row3_y = y + _sf(62)
+            right_pad = _sf(10)
+
+            # Title (row 1) — truncate with "…" so it never wraps onto row 2.
+            title_max = max(x1 - tx - _sf(12), _sf(40))
+            title_text = self._truncate_title(item["name"], title_max)
             self._canvas.create_text(
-                tx, y + 10, text=item["name"], anchor="nw",
-                fill=accent, font=(FONT_FAMILY, 14, "bold"),
-                width=x1 - tx - 12,
+                tx, row1_y, text=title_text, anchor="nw",
+                fill=accent, font=(FONT_FAMILY, _sfont(13), "bold"),
             )
 
             if kind == "tournament":
@@ -361,51 +473,51 @@ class CanvasGameList:
                 status_text = item.get("status", "")
                 status_color = item.get("status_color", NEON_CYAN)
                 self._canvas.create_text(
-                    tx, y + 36, text=status_text, anchor="nw",
-                    fill=status_color, font=(FONT_FAMILY, 13, "bold"),
+                    tx, row2_y, text=status_text, anchor="nw",
+                    fill=status_color, font=(FONT_FAMILY, _sfont(12), "bold"),
                 )
                 if item.get("dates"):
                     self._canvas.create_text(
-                        tx + 84, y + 36, text=item["dates"], anchor="nw",
-                        fill=FG_DEFAULT, font=(FONT_FAMILY, 12),
+                        tx + _sf(84), row2_y, text=item["dates"], anchor="nw",
+                        fill=FG_DEFAULT, font=(FONT_FAMILY, _sfont(12)),
                     )
                 # User's best rank (right-aligned)
                 if item.get("user_rank_str"):
                     self._canvas.create_text(
-                        x1 - 10, y + 36, text=item["user_rank_str"], anchor="ne",
-                        fill=NEON_YELLOW, font=(FONT_FAMILY, 12, "bold"),
+                        x1 - right_pad, row2_y, text=item["user_rank_str"], anchor="ne",
+                        fill=NEON_YELLOW, font=(FONT_FAMILY, _sfont(12), "bold"),
                     )
                 # Row 3: subtitle (e.g. "5 games")
                 if item.get("subtitle"):
                     self._canvas.create_text(
-                        tx, y + 62, text=item["subtitle"], anchor="nw",
-                        fill=AMBER_DIM, font=(FONT_FAMILY, 12),
+                        tx, row3_y, text=item["subtitle"], anchor="nw",
+                        fill=AMBER_DIM, font=(FONT_FAMILY, _sfont(12)),
                     )
             else:
                 # Row 2: Rank (full format) + Gap (right-aligned)
                 self._canvas.create_text(
-                    tx, y + 36, text=item['rank_str'], anchor="nw",
-                    fill=NEON_CYAN, font=(FONT_FAMILY, 13, "bold"),
+                    tx, row2_y, text=item['rank_str'], anchor="nw",
+                    fill=NEON_CYAN, font=(FONT_FAMILY, _sfont(12), "bold"),
                 )
                 if item["gap_str"]:
                     self._canvas.create_text(
-                        x1 - 10, y + 36, text=item["gap_str"], anchor="ne",
-                        fill=NEON_ORANGE, font=(FONT_FAMILY, 12, "bold"),
+                        x1 - right_pad, row2_y, text=item["gap_str"], anchor="ne",
+                        fill=NEON_ORANGE, font=(FONT_FAMILY, _sfont(12), "bold"),
                     )
 
                 # Row 3: Score (left) + Next Target (right, dim)
                 if item["score_str"]:
                     self._canvas.create_text(
-                        tx, y + 62, text=item["score_str"], anchor="nw",
-                        fill=NEON_YELLOW, font=(FONT_FAMILY, 13),
+                        tx, row3_y, text=item["score_str"], anchor="nw",
+                        fill=NEON_YELLOW, font=(FONT_FAMILY, _sfont(12)),
                     )
                 if item["target"]:
                     target_text = f"→ {item['target']}"
                     if item.get("target_score"):
                         target_text += f"  [{item['target_score']}]"
                     self._canvas.create_text(
-                        x1 - 10, y + 62, text=target_text, anchor="ne",
-                        fill=AMBER_DIM, font=(FONT_FAMILY, 12),
+                        x1 - right_pad, row3_y, text=target_text, anchor="ne",
+                        fill=AMBER_DIM, font=(FONT_FAMILY, _sfont(12)),
                     )
 
         total_h = max(len(self._items) * self.CARD_TOTAL + self.CARD_PAD_Y, 1)
@@ -515,6 +627,10 @@ class CanvasGameList:
 
 class ScoreChaserApp:
     def __init__(self):
+        # Opt into Windows DPI awareness BEFORE creating Tk so that
+        # winfo_fpixels() reports physical DPI and the OS doesn't bitmap-scale.
+        _enable_dpi_awareness()
+
         # Register TTF files with the OS before Tk initializes — Tk reads
         # the Windows font table once, so fonts added afterwards are often
         # invisible to it.
@@ -528,6 +644,7 @@ class ScoreChaserApp:
         # and update the FONT_FAMILY / TITLE_FONT_FAMILY globals before
         # any widget is built.
         _detect_installed_fonts(self.root)
+        _apply_dpi_scaling(self.root)
 
         self.root.title("ScoreChaser - ATGames Leaderboards")
         self.root.geometry("1400x800")
@@ -705,9 +822,10 @@ class ScoreChaserApp:
 
         self._players_text = tk.Text(
             players_wrap, bg=BG_DARK, fg=FG_DEFAULT,
-            font=(FONT_FAMILY, 14), bd=0, highlightthickness=0,
-            padx=12, pady=6, wrap="none", cursor="arrow",
-            spacing1=3, spacing3=3, tabs="56 300 right",
+            font=(FONT_FAMILY, _sfont(14)), bd=0, highlightthickness=0,
+            padx=_sf(12), pady=_sf(6), wrap="none", cursor="arrow",
+            spacing1=_sf(3), spacing3=_sf(3),
+            tabs=f"{_sf(56)} {_sf(300)} right",
             tabstyle="tabular",
         )
         # Keep the right tab aligned to the current text widget width
@@ -724,23 +842,23 @@ class ScoreChaserApp:
         # zebra stripes for clearer row separation.
         self._players_text.tag_configure(
             "row_a", background=BG_CARD,
-            lmargin1=12, lmargin2=12, rmargin=12,
-            spacing1=8, spacing3=8)
+            lmargin1=_sf(12), lmargin2=_sf(12), rmargin=_sf(12),
+            spacing1=_sf(8), spacing3=_sf(8))
         self._players_text.tag_configure(
             "row_b", background=BG_CARD_HOVER,
-            lmargin1=12, lmargin2=12, rmargin=12,
-            spacing1=8, spacing3=8)
+            lmargin1=_sf(12), lmargin2=_sf(12), rmargin=_sf(12),
+            spacing1=_sf(8), spacing3=_sf(8))
         self._players_text.tag_configure(
-            "top1", foreground=GOLD, font=(FONT_FAMILY, 18, "bold"))
+            "top1", foreground=GOLD, font=(FONT_FAMILY, _sfont(18), "bold"))
         self._players_text.tag_configure(
-            "top2", foreground=AMBER_BRIGHT, font=(FONT_FAMILY, 17, "bold"))
+            "top2", foreground=AMBER_BRIGHT, font=(FONT_FAMILY, _sfont(17), "bold"))
         self._players_text.tag_configure(
-            "top3", foreground=NEON_ORANGE, font=(FONT_FAMILY, 16, "bold"))
+            "top3", foreground=NEON_ORANGE, font=(FONT_FAMILY, _sfont(16), "bold"))
         self._players_text.tag_configure(
-            "top10", foreground=AMBER, font=(FONT_FAMILY, 14, "bold"))
+            "top10", foreground=AMBER, font=(FONT_FAMILY, _sfont(14), "bold"))
         self._players_text.tag_configure(
             "me", foreground=AMBER_BRIGHT, background=BG_CARD_SELECTED,
-            font=(FONT_FAMILY, 14, "bold"))
+            font=(FONT_FAMILY, _sfont(14), "bold"))
         self._players_text.tag_configure(
             "selected_row", background=BG_CARD_HOVER)
         self._players_text.bind("<Button-1>", self._on_player_click)
@@ -795,7 +913,7 @@ class ScoreChaserApp:
         self._ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=FG_DEFAULT,
                                   activebackground=AMBER_DIM,
                                   activeforeground=AMBER_BRIGHT,
-                                  font=(FONT_FAMILY, 12))
+                                  font=(FONT_FAMILY, _sfont(12)))
         self._ctx_menu.add_command(label="Hide game", command=self._ctx_hide_game)
         self._ctx_game_id: str | None = None
 
@@ -803,7 +921,7 @@ class ScoreChaserApp:
         self._lb_ctx_menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=FG_DEFAULT,
                                      activebackground=AMBER_DIM,
                                      activeforeground=AMBER_BRIGHT,
-                                     font=(FONT_FAMILY, 12))
+                                     font=(FONT_FAMILY, _sfont(12)))
         self._lb_ctx_menu.add_command(label="Search this user",
                                        command=self._ctx_search_user)
         self._lb_ctx_username: str | None = None
@@ -1655,8 +1773,8 @@ class ScoreChaserApp:
     def _on_players_resize(self, event):
         # Right-align points column near the widget's right edge
         # (account for padx=12 on each side + a few px breathing room)
-        right = max(140, event.width - 24)
-        self._players_text.configure(tabs=f"56 {right} right")
+        right = max(_sf(140), event.width - _sf(24))
+        self._players_text.configure(tabs=f"{_sf(56)} {right} right")
 
     def _on_player_click(self, event):
         txt = self._players_text
@@ -1714,7 +1832,7 @@ class ScoreChaserApp:
 
         ctk.CTkLabel(
             header, text=name.upper(),
-            font=(TITLE_FONT_FAMILY, 18), text_color=AMBER,
+            font=(TITLE_FONT_FAMILY, 17), text_color=AMBER,
             anchor="w",
         ).pack(fill="x")
 
@@ -1725,7 +1843,7 @@ class ScoreChaserApp:
         else:
             summary = f"{summary}   ·   {len(entries)} Top-100 entries"
         ctk.CTkLabel(
-            header, text=summary, font=(FONT_FAMILY, 12),
+            header, text=summary, font=(FONT_FAMILY, 13),
             text_color=NEON_YELLOW, anchor="w",
         ).pack(fill="x", pady=(2, 0))
 
@@ -1757,13 +1875,13 @@ class ScoreChaserApp:
                                      text_color=rc, anchor="w", cursor="hand2")
             rank_lbl.pack(side="left", padx=(10, 0), pady=4)
             name_lbl = ctk.CTkLabel(row, text=game.get("name", "")[:40],
-                                     font=(FONT_FAMILY, 12),
+                                     font=(FONT_FAMILY, 13),
                                      text_color=FG_DEFAULT, anchor="w",
                                      cursor="hand2")
             name_lbl.pack(side="left", fill="x", expand=True, pady=4)
             score_lbl = ctk.CTkLabel(row,
                                       text=_format_score(str(s.get("score", "0"))),
-                                      font=(FONT_FAMILY, 12),
+                                      font=(FONT_FAMILY, 13),
                                       text_color=NEON_YELLOW, anchor="e",
                                       cursor="hand2")
             score_lbl.pack(side="right", padx=(0, 12), pady=4)
@@ -1935,7 +2053,7 @@ class ScoreChaserApp:
         header.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(
             header, text=tournament.get("name", "").upper(),
-            font=(TITLE_FONT_FAMILY, 16), text_color=AMBER,
+            font=(TITLE_FONT_FAMILY, 17), text_color=AMBER,
             anchor="w", wraplength=500,
         ).pack(fill="x")
 
@@ -2060,12 +2178,12 @@ class ScoreChaserApp:
                     if gap_str:
                         target_text += f"   ({gap_str})"
                     ctk.CTkLabel(
-                        info, text=target_text, font=(FONT_FAMILY, 12),
+                        info, text=target_text, font=(FONT_FAMILY, 13),
                         text_color=AMBER_BRIGHT, anchor="w",
                     ).pack(fill="x", pady=(2, 0))
                 else:
                     ctk.CTkLabel(
-                        info, text="✓ You're #1 here!", font=(FONT_FAMILY, 12, "bold"),
+                        info, text="✓ You're #1 here!", font=(FONT_FAMILY, 13, "bold"),
                         text_color=NEON_GREEN, anchor="w",
                     ).pack(fill="x", pady=(2, 0))
             elif search:
@@ -2077,7 +2195,7 @@ class ScoreChaserApp:
                     if target_score:
                         txt += f"  [{target_score}]"
                     ctk.CTkLabel(
-                        info, text=txt, font=(FONT_FAMILY, 12),
+                        info, text=txt, font=(FONT_FAMILY, 13),
                         text_color=FG_DIM, anchor="w",
                     ).pack(fill="x", pady=(2, 0))
 
@@ -2085,7 +2203,7 @@ class ScoreChaserApp:
             if not scores:
                 ctk.CTkLabel(
                     self._detail_panel, text="No scores",
-                    font=(FONT_FAMILY, 12), text_color=FG_DIM, anchor="w",
+                    font=(FONT_FAMILY, 13), text_color=FG_DIM, anchor="w",
                 ).pack(fill="x", padx=24, pady=(0, 4))
                 continue
 
@@ -2101,17 +2219,17 @@ class ScoreChaserApp:
                 row = ctk.CTkFrame(self._detail_panel, fg_color="transparent",
                                     cursor="hand2")
                 row.pack(fill="x", padx=16)
-                ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 12),
+                ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 13),
                              text_color=fg, width=40, anchor="e",
                              cursor="hand2").pack(side="left")
-                ctk.CTkLabel(row, text=name, font=(FONT_FAMILY, 12),
+                ctk.CTkLabel(row, text=name, font=(FONT_FAMILY, 13),
                              text_color=fg, width=140, anchor="w",
                              cursor="hand2").pack(side="left", padx=(8, 0))
                 ctk.CTkLabel(row, text=_format_score(score),
-                             font=(FONT_FAMILY, 12), text_color=fg,
+                             font=(FONT_FAMILY, 13), text_color=fg,
                              anchor="e", cursor="hand2").pack(side="left", padx=(4, 0))
                 ctk.CTkLabel(row, text=_hw_name(s.get("hardware", "")),
-                             font=(FONT_FAMILY, 13), text_color=FG_DIM,
+                             font=(FONT_FAMILY, 12), text_color=FG_DIM,
                              width=80, anchor="e",
                              cursor="hand2").pack(side="right")
                 if name:
@@ -2162,7 +2280,7 @@ class ScoreChaserApp:
 
         ctk.CTkLabel(
             title_frame, text=game["name"].upper(),
-            font=(TITLE_FONT_FAMILY, 15), text_color=AMBER,
+            font=(TITLE_FONT_FAMILY, 17), text_color=AMBER,
             anchor="w", wraplength=400,
         ).pack(fill="x")
 
@@ -2186,7 +2304,7 @@ class ScoreChaserApp:
             ctk.CTkLabel(
                 title_frame,
                 text=f"Your Score: {_format_score(user_entry.get('score', '0'))}  |  Rank: {rank_display}",
-                font=(FONT_FAMILY, 12), text_color=NEON_YELLOW, anchor="w",
+                font=(FONT_FAMILY, 13), text_color=NEON_YELLOW, anchor="w",
             ).pack(fill="x", pady=(4, 0))
 
         # Separator
@@ -2264,7 +2382,7 @@ class ScoreChaserApp:
                 ctk.CTkLabel(section, text=label, font=(FONT_FAMILY, 14, "bold"),
                              text_color=color, anchor="w").pack(fill="x")
                 loading = ctk.CTkLabel(section, text="Loading...",
-                                        font=(FONT_FAMILY, 12), text_color=FG_DIM,
+                                        font=(FONT_FAMILY, 13), text_color=FG_DIM,
                                         anchor="w")
                 loading.pack(fill="x")
                 self._load_time_scores(internal, period, section, loading)
@@ -2300,17 +2418,17 @@ class ScoreChaserApp:
                 GOLD if rank == 1 else (
                     NEON_GREEN if rank <= 10 else FG_DEFAULT))
 
-            ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 12),
+            ctk.CTkLabel(row, text=f"#{rank}", font=(FONT_FAMILY, 13),
                          text_color=fg, width=40, anchor="e",
                          cursor="hand2").pack(side="left")
-            ctk.CTkLabel(row, text=username, font=(FONT_FAMILY, 12),
+            ctk.CTkLabel(row, text=username, font=(FONT_FAMILY, 13),
                          text_color=fg, width=130, anchor="w",
                          cursor="hand2").pack(side="left", padx=(8, 0))
             ctk.CTkLabel(row, text=_format_score(s.get("score", "0")),
-                         font=(FONT_FAMILY, 12), text_color=fg,
+                         font=(FONT_FAMILY, 13), text_color=fg,
                          anchor="e", cursor="hand2").pack(side="left", padx=(4, 0))
             ctk.CTkLabel(row, text=_hw_name(s.get("hardware", "")),
-                         font=(FONT_FAMILY, 13), text_color=FG_DIM,
+                         font=(FONT_FAMILY, 12), text_color=FG_DIM,
                          width=80, anchor="e",
                          cursor="hand2").pack(side="right")
 
@@ -2332,16 +2450,16 @@ class ScoreChaserApp:
             overall_r2, device_r2, device_nm2 = self._resolve_user_ranks(
                 game.get("scores", []), user_entry, in_top100, search)
             rank_display = _format_rank_display(overall_r2, device_r2, device_nm2)
-            ctk.CTkLabel(row, text=rank_display, font=(FONT_FAMILY, 12, "bold"),
+            ctk.CTkLabel(row, text=rank_display, font=(FONT_FAMILY, 13, "bold"),
                          text_color=NEON_YELLOW, anchor="w",
                          cursor="hand2").pack(side="left", padx=(4, 0))
             user_name = user_entry.get("userName", "")
             ctk.CTkLabel(row, text=user_name,
-                         font=(FONT_FAMILY, 12, "bold"), text_color=NEON_YELLOW,
+                         font=(FONT_FAMILY, 13, "bold"), text_color=NEON_YELLOW,
                          width=130, anchor="w",
                          cursor="hand2").pack(side="left", padx=(8, 0))
             ctk.CTkLabel(row, text=_format_score(user_entry.get("score", "0")),
-                         font=(FONT_FAMILY, 12, "bold"), text_color=NEON_YELLOW,
+                         font=(FONT_FAMILY, 13, "bold"), text_color=NEON_YELLOW,
                          anchor="e", cursor="hand2").pack(side="left", padx=(4, 0))
             if user_name:
                 for w in [row] + list(row.winfo_children()):
@@ -2362,12 +2480,12 @@ class ScoreChaserApp:
     def _display_time_scores(self, scores, parent, loading_label):
         loading_label.destroy()
         if not scores:
-            ctk.CTkLabel(parent, text="No scores", font=(FONT_FAMILY, 12),
+            ctk.CTkLabel(parent, text="No scores", font=(FONT_FAMILY, 13),
                          text_color=FG_DIM, anchor="w").pack(fill="x")
             return
         for s in scores[:3]:
             text = f"#{s.get('rank', '?')}  {s.get('userName', '')}  {_format_score(s.get('score', '0'))}"
-            ctk.CTkLabel(parent, text=text, font=(FONT_FAMILY, 12),
+            ctk.CTkLabel(parent, text=text, font=(FONT_FAMILY, 13),
                          text_color=FG_DEFAULT, anchor="w").pack(fill="x")
 
     # ── Boxart (detail view) ──────────────────────────────────────
@@ -2389,10 +2507,16 @@ class ScoreChaserApp:
                 resp = self._http.get(url, timeout=8)
                 resp.raise_for_status()
                 pil = Image.open(io.BytesIO(resp.content))
-                h = height
-                w = int(pil.width * h / pil.height) if pil.height else h
-                pil = pil.resize((w, h), Image.LANCZOS)
-                self.root.after(0, lambda: self._set_boxart(key, pil, w, h, target_label))
+                # Resize at physical pixel size for sharpness on hi-DPI;
+                # CTkImage's size= takes logical units and scales internally.
+                physical_h = _sf(height)
+                w_physical = (int(pil.width * physical_h / pil.height)
+                              if pil.height else physical_h)
+                pil = pil.resize((w_physical, physical_h), Image.LANCZOS)
+                logical_w = (int(round(w_physical / UI_SCALE))
+                             if UI_SCALE > 1.0 else w_physical)
+                self.root.after(0, lambda: self._set_boxart(
+                    key, pil, logical_w, height, target_label))
             except Exception:
                 pass
 
